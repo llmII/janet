@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -86,7 +86,7 @@ void janet_debug_find(
                 }
             }
         }
-        current = current->next;
+        current = current->data.next;
     }
     if (best_def) {
         *def_out = best_def;
@@ -96,15 +96,19 @@ void janet_debug_find(
     }
 }
 
+void janet_stacktrace(JanetFiber *fiber, Janet err) {
+    const char *prefix = janet_checktype(err, JANET_NIL) ? NULL : "";
+    janet_stacktrace_ext(fiber, err, prefix);
+}
+
 /* Error reporting. This can be emulated from within Janet, but for
  * consitency with the top level code it is defined once. */
-void janet_stacktrace(JanetFiber *fiber, Janet err) {
+void janet_stacktrace_ext(JanetFiber *fiber, Janet err, const char *prefix) {
+
     int32_t fi;
     const char *errstr = (const char *)janet_to_string(err);
     JanetFiber **fibers = NULL;
-
-    /* Don't print error line if it is nil. */
-    int wrote_error = janet_checktype(err, JANET_NIL);
+    int wrote_error = !prefix;
 
     int print_color = janet_truthy(janet_dyn("err-color"));
     if (print_color) janet_eprintf("\x1b[31m");
@@ -126,11 +130,10 @@ void janet_stacktrace(JanetFiber *fiber, Janet err) {
             /* Print prelude to stack frame */
             if (!wrote_error) {
                 JanetFiberStatus status = janet_fiber_status(fiber);
-                const char *prefix = status == JANET_STATUS_ERROR ? "" : "status ";
                 janet_eprintf("%s%s: %s\n",
-                              prefix,
+                              prefix ? prefix : "",
                               janet_status_names[status],
-                              errstr);
+                              errstr ? errstr : janet_status_names[status]);
                 wrote_error = 1;
             }
 
@@ -311,6 +314,7 @@ static Janet doframe(JanetStackFrame *frame) {
     if (frame->func && frame->pc) {
         Janet *stack = (Janet *)frame + JANET_FRAME_SIZE;
         JanetArray *slots;
+        janet_assert(def != NULL, "def != NULL");
         off = (int32_t)(frame->pc - def->bytecode);
         janet_table_put(t, janet_ckeywordv("pc"), janet_wrap_integer(off));
         if (def->sourcemap) {
@@ -326,6 +330,27 @@ static Janet doframe(JanetStackFrame *frame) {
         safe_memcpy(slots->data, stack, sizeof(Janet) * def->slotcount);
         slots->count = def->slotcount;
         janet_table_put(t, janet_ckeywordv("slots"), janet_wrap_array(slots));
+        /* Add local bindings */
+        if (def->symbolmap) {
+            JanetTable *local_bindings = janet_table(0);
+            for (int32_t i = def->symbolmap_length - 1; i >= 0; i--) {
+                JanetSymbolMap jsm = def->symbolmap[i];
+                Janet value = janet_wrap_nil();
+                uint32_t pc = (uint32_t)(frame->pc - def->bytecode);
+                if (jsm.birth_pc == UINT32_MAX) {
+                    JanetFuncEnv *env = frame->func->envs[jsm.death_pc];
+                    if (env->offset > 0) {
+                        value = env->as.fiber->data[env->offset + jsm.slot_index];
+                    } else {
+                        value = env->as.values[jsm.slot_index];
+                    }
+                } else if (pc >= jsm.birth_pc && pc < jsm.death_pc) {
+                    value = stack[jsm.slot_index];
+                }
+                janet_table_put(local_bindings, janet_wrap_symbol(jsm.symbol), value);
+            }
+            janet_table_put(t, janet_ckeywordv("locals"), janet_wrap_table(local_bindings));
+        }
     }
     return janet_wrap_table(t);
 }
@@ -337,9 +362,9 @@ JANET_CORE_FN(cfun_debug_stack,
               "stack frame is the first table in the array, and the bottom-most stack frame "
               "is the last value. Each stack frame contains some of the following attributes:\n\n"
               "* :c - true if the stack frame is a c function invocation\n\n"
-              "* :column - the current source column of the stack frame\n\n"
+              "* :source-column - the current source column of the stack frame\n\n"
               "* :function - the function that the stack frame represents\n\n"
-              "* :line - the current source line of the stack frame\n\n"
+              "* :source-line - the current source line of the stack frame\n\n"
               "* :name - the human-friendly name of the function\n\n"
               "* :pc - integer indicating the location of the program counter\n\n"
               "* :source - string with the file path or other identifier for the source code\n\n"
@@ -361,14 +386,15 @@ JANET_CORE_FN(cfun_debug_stack,
 }
 
 JANET_CORE_FN(cfun_debug_stacktrace,
-              "(debug/stacktrace fiber &opt err)",
+              "(debug/stacktrace fiber &opt err prefix)",
               "Prints a nice looking stacktrace for a fiber. Can optionally provide "
-              "an error value to print the stack trace with. If `err` is nil or not "
+              "an error value to print the stack trace with. If `prefix` is nil or not "
               "provided, will skip the error line. Returns the fiber.") {
-    janet_arity(argc, 1, 2);
+    janet_arity(argc, 1, 3);
     JanetFiber *fiber = janet_getfiber(argv, 0);
     Janet x = argc == 1 ? janet_wrap_nil() : argv[1];
-    janet_stacktrace(fiber, x);
+    const char *prefix = janet_optcstring(argv, argc, 2, NULL);
+    janet_stacktrace_ext(fiber, x, prefix);
     return argv[0];
 }
 

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -30,6 +30,8 @@
 
 #include <string.h>
 #include <ctype.h>
+#include <inttypes.h>
+#include <float.h>
 
 /* Implements a pretty printer for Janet. The pretty printer
  * is simple and not that flexible, but fast. */
@@ -37,11 +39,15 @@
 /* Temporary buffer size */
 #define BUFSIZE 64
 
+/* Preprocessor hacks */
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+
 static void number_to_string_b(JanetBuffer *buffer, double x) {
     janet_buffer_ensure(buffer, buffer->count + BUFSIZE, 2);
     const char *fmt = (x == floor(x) &&
                        x <= JANET_INTMAX_DOUBLE &&
-                       x >= JANET_INTMIN_DOUBLE) ? "%.0f" : "%g";
+                       x >= JANET_INTMIN_DOUBLE) ? "%.0f" : ("%." STR(DBL_DIG) "g");
     int count;
     if (x == 0.0) {
         /* Prevent printing of '-0' */
@@ -108,7 +114,7 @@ static void string_description_b(JanetBuffer *buffer, const char *title, void *p
     pbuf.p = pointer;
     *c++ = '<';
     /* Maximum of 32 bytes for abstract type name */
-    for (i = 0; title[i] && i < 32; ++i)
+    for (i = 0; i < 32 && title[i]; ++i)
         *c++ = ((uint8_t *)title) [i];
     *c++ = ' ';
     *c++ = '0';
@@ -150,6 +156,12 @@ static void janet_escape_string_impl(JanetBuffer *buffer, const uint8_t *str, in
                 break;
             case '\v':
                 janet_buffer_push_bytes(buffer, (const uint8_t *)"\\v", 2);
+                break;
+            case '\a':
+                janet_buffer_push_bytes(buffer, (const uint8_t *)"\\a", 2);
+                break;
+            case '\b':
+                janet_buffer_push_bytes(buffer, (const uint8_t *)"\\b", 2);
                 break;
             case 27:
                 janet_buffer_push_bytes(buffer, (const uint8_t *)"\\e", 2);
@@ -243,6 +255,10 @@ void janet_to_string_b(JanetBuffer *buffer, Janet x) {
         case JANET_FUNCTION: {
             JanetFunction *fun = janet_unwrap_function(x);
             JanetFuncDef *def = fun->def;
+            if (def == NULL) {
+                janet_buffer_push_cstring(buffer, "<incomplete function>");
+                break;
+            }
             if (def->name) {
                 const uint8_t *n = def->name;
                 janet_buffer_push_cstring(buffer, "<function ");
@@ -261,21 +277,13 @@ void janet_to_string_b(JanetBuffer *buffer, Janet x) {
 
 /* See parse.c for full table */
 
-static const uint32_t pp_symchars[8] = {
-    0x00000000, 0xf7ffec72, 0xc7ffffff, 0x07fffffe,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000
-};
-
-static int pp_is_symbol_char(uint8_t c) {
-    return pp_symchars[c >> 5] & ((uint32_t)1 << (c & 0x1F));
-}
-
 /* Check if a symbol or keyword contains no symbol characters */
 static int contains_bad_chars(const uint8_t *sym, int issym) {
     int32_t len = janet_string_length(sym);
     if (len && issym && sym[0] >= '0' && sym[0] <= '9') return 1;
+    if (!janet_valid_utf8(sym, len)) return 1;
     for (int32_t i = 0; i < len; i++) {
-        if (!pp_is_symbol_char(sym[i])) return 1;
+        if (!janet_is_symbol_char(sym[i])) return 1;
     }
     return 0;
 }
@@ -570,12 +578,12 @@ static void janet_pretty_one(struct pretty *S, Janet x, int is_dict_value) {
         case JANET_STRUCT:
         case JANET_TABLE: {
             int istable = janet_checktype(x, JANET_TABLE);
-            janet_buffer_push_cstring(S->buffer, istable ? "@" : "{");
 
             /* For object-like tables, print class name */
             if (istable) {
                 JanetTable *t = janet_unwrap_table(x);
                 JanetTable *proto = t->proto;
+                janet_buffer_push_cstring(S->buffer, "@");
                 if (NULL != proto) {
                     Janet name = janet_table_get(proto, janet_ckeywordv("_name"));
                     const uint8_t *n;
@@ -590,8 +598,25 @@ static void janet_pretty_one(struct pretty *S, Janet x, int is_dict_value) {
                         }
                     }
                 }
-                janet_buffer_push_cstring(S->buffer, "{");
+            } else {
+                JanetStruct st = janet_unwrap_struct(x);
+                JanetStruct proto = janet_struct_proto(st);
+                if (NULL != proto) {
+                    Janet name = janet_struct_get(proto, janet_ckeywordv("_name"));
+                    const uint8_t *n;
+                    int32_t len;
+                    if (janet_bytes_view(name, &n, &len)) {
+                        if (S->flags & JANET_PRETTY_COLOR) {
+                            janet_buffer_push_cstring(S->buffer, janet_class_color);
+                        }
+                        janet_buffer_push_bytes(S->buffer, n, len);
+                        if (S->flags & JANET_PRETTY_COLOR) {
+                            janet_buffer_push_cstring(S->buffer, "\x1B[0m");
+                        }
+                    }
+                }
             }
+            janet_buffer_push_cstring(S->buffer, "{");
 
             S->depth--;
             S->indent += 2;
@@ -627,7 +652,7 @@ static void janet_pretty_one(struct pretty *S, Janet x, int is_dict_value) {
                     }
                 }
 
-                janet_sorted_keys(kvs, cap, S->keysort_buffer + ks_start);
+                janet_sorted_keys(kvs, cap, S->keysort_buffer == NULL ? NULL : S->keysort_buffer + ks_start);
                 S->keysort_start += len;
                 if (!(S->flags & JANET_PRETTY_NOTRUNC) && (len > JANET_PRETTY_DICT_LIMIT)) {
                     len = JANET_PRETTY_DICT_LIMIT;
@@ -726,7 +751,7 @@ static void pushtypes(JanetBuffer *buffer, int types) {
             if (first) {
                 first = 0;
             } else {
-                janet_buffer_push_u8(buffer, '|');
+                janet_buffer_push_cstring(buffer, (types == 1) ? " or " : ", ");
             }
             janet_buffer_push_cstring(buffer, janet_type_names[i]);
         }
@@ -741,7 +766,34 @@ static void pushtypes(JanetBuffer *buffer, int types) {
 
 #define MAX_ITEM  256
 #define FMT_FLAGS "-+ #0"
+#define FMT_REPLACE_INTTYPES "diouxX"
 #define MAX_FORMAT 32
+
+struct FmtMapping {
+    char c;
+    const char *mapping;
+};
+
+/* Janet uses fixed width integer types for most things, so map
+ * format specifiers to these fixed sizes */
+static const struct FmtMapping format_mappings[] = {
+    {'D', PRId64},
+    {'I', PRIi64},
+    {'d', PRId64},
+    {'i', PRIi64},
+    {'o', PRIo64},
+    {'u', PRIu64},
+    {'x', PRIx64},
+    {'X', PRIX64},
+};
+
+static const char *get_fmt_mapping(char c) {
+    for (size_t i = 0; i < (sizeof(format_mappings) / sizeof(struct FmtMapping)); i++) {
+        if (format_mappings[i].c == c)
+            return format_mappings[i].mapping;
+    }
+    janet_assert(0, "bad format mapping");
+}
 
 static const char *scanformat(
     const char *strfrmt,
@@ -749,12 +801,13 @@ static const char *scanformat(
     char width[3],
     char precision[3]) {
     const char *p = strfrmt;
+
+    /* Parse strfrmt */
     memset(width, '\0', 3);
     memset(precision, '\0', 3);
     while (*p != '\0' && strchr(FMT_FLAGS, *p) != NULL)
         p++; /* skip flags */
-    if ((size_t)(p - strfrmt) >= sizeof(FMT_FLAGS) / sizeof(char))
-        janet_panic("invalid format (repeated flags)");
+    if ((size_t)(p - strfrmt) >= sizeof(FMT_FLAGS)) janet_panic("invalid format (repeated flags)");
     if (isdigit((int)(*p)))
         width[0] = *p++; /* skip width */
     if (isdigit((int)(*p)))
@@ -768,10 +821,23 @@ static const char *scanformat(
     }
     if (isdigit((int)(*p)))
         janet_panic("invalid format (width or precision too long)");
+
+    /* Write to form - replace characters with fixed size stuff */
     *(form++) = '%';
-    memcpy(form, strfrmt, ((p - strfrmt) + 1) * sizeof(char));
-    form += (p - strfrmt) + 1;
+    const char *p2 = strfrmt;
+    while (p2 <= p) {
+        char *loc = strchr(FMT_REPLACE_INTTYPES, *p2);
+        if (loc != NULL && *loc != '\0') {
+            const char *mapping = get_fmt_mapping(*p2++);
+            size_t len = strlen(mapping);
+            strcpy(form, mapping);
+            form += len;
+        } else {
+            *(form++) = *(p2++);
+        }
+    }
     *form = '\0';
+
     return p;
 }
 
@@ -791,16 +857,27 @@ void janet_formatbv(JanetBuffer *b, const char *format, va_list args) {
             c = scanformat(c, form, width, precision);
             switch (*c++) {
                 case 'c': {
-                    int n = va_arg(args, long);
+                    int n = va_arg(args, int);
                     nb = snprintf(item, MAX_ITEM, form, n);
                     break;
                 }
                 case 'd':
-                case 'i':
-                case 'o':
+                case 'i': {
+                    int64_t n = (int64_t) va_arg(args, int32_t);
+                    nb = snprintf(item, MAX_ITEM, form, n);
+                    break;
+                }
+                case 'D':
+                case 'I': {
+                    int64_t n = va_arg(args, int64_t);
+                    nb = snprintf(item, MAX_ITEM, form, n);
+                    break;
+                }
                 case 'x':
-                case 'X': {
-                    int32_t n = va_arg(args, long);
+                case 'X':
+                case 'o':
+                case 'u': {
+                    uint64_t n = va_arg(args, uint64_t);
                     nb = snprintf(item, MAX_ITEM, form, n);
                     break;
                 }
@@ -844,7 +921,7 @@ void janet_formatbv(JanetBuffer *b, const char *format, va_list args) {
                     janet_buffer_push_cstring(b, typestr(va_arg(args, Janet)));
                     break;
                 case 'T': {
-                    int types = va_arg(args, long);
+                    int types = va_arg(args, int);
                     pushtypes(b, types);
                     break;
                 }
@@ -953,12 +1030,19 @@ void janet_buffer_format(
                                   janet_getinteger(argv, arg));
                     break;
                 }
+                case 'D':
+                case 'I':
                 case 'd':
-                case 'i':
-                case 'o':
+                case 'i': {
+                    int64_t n = janet_getinteger64(argv, arg);
+                    nb = snprintf(item, MAX_ITEM, form, n);
+                    break;
+                }
                 case 'x':
-                case 'X': {
-                    int32_t n = janet_getinteger(argv, arg);
+                case 'X':
+                case 'o':
+                case 'u': {
+                    uint64_t n = janet_getuinteger64(argv, arg);
                     nb = snprintf(item, MAX_ITEM, form, n);
                     break;
                 }
@@ -974,8 +1058,9 @@ void janet_buffer_format(
                     break;
                 }
                 case 's': {
-                    const uint8_t *s = janet_getstring(argv, arg);
-                    int32_t l = janet_string_length(s);
+                    JanetByteView bytes = janet_getbytes(argv, arg);
+                    const uint8_t *s = bytes.bytes;
+                    int32_t l = bytes.len;
                     if (form[2] == '\0')
                         janet_buffer_push_bytes(b, s, l);
                     else {

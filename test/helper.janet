@@ -2,8 +2,10 @@
 
 (var num-tests-passed 0)
 (var num-tests-run 0)
-(var suite-num 0)
+(var suite-name 0)
 (var start-time 0)
+
+(def is-verbose (os/getenv "VERBOSE"))
 
 (defn assert
   "Override's the default assert with some nice error handling."
@@ -12,11 +14,12 @@
   (++ num-tests-run)
   (when x (++ num-tests-passed))
   (def str (string e))
-  (def truncated
-    (if (> (length e) 40) (string (string/slice e 0 35) "...") (describe e)))
+  (def frame (last (debug/stack (fiber/current))))
+  (def line-info (string/format "%s:%d"
+                              (frame :source) (frame :source-line)))
   (if x
-    (eprintf "\e[32m✔\e[0m %s: %v" truncated x)
-    (eprintf "\n\e[31m✘\e[0m %s: %v" truncated x))
+    (when is-verbose (eprintf "\e[32m✔\e[0m %s: %s: %v" line-info (describe e) x))
+    (do (eprintf "\e[31m✘\e[0m %s: %s: %v" line-info (describe e) x) (eflush)))
   x)
 
 (defmacro assert-error
@@ -24,18 +27,30 @@
   (def errsym (keyword (gensym)))
   ~(assert (= ,errsym (try (do ,;forms) ([_] ,errsym))) ,msg))
 
+(defn check-compile-error
+  [form]
+  (def result (compile form))
+  (assert (table? result) (string/format "expected compilation error for %j, but compiled without error" form)))
+
 (defmacro assert-no-error
   [msg & forms]
-  (def errsym (keyword (gensym)))
-  ~(assert (not= ,errsym (try (do ,;forms) ([_] ,errsym))) ,msg))
+  (def e (gensym))
+  (def f (gensym))
+  (if is-verbose
+  ~(try (do ,;forms (,assert true ,msg)) ([,e ,f] (,assert false ,msg) (,debug/stacktrace ,f ,e "\e[31m✘\e[0m ")))
+  ~(try (do ,;forms (,assert true ,msg)) ([_] (,assert false ,msg)))))
 
-(defn start-suite [x]
-  (set suite-num x)
+(defn start-suite [&opt x]
+  (default x (dyn :current-file))
+  (set suite-name
+       (cond
+         (number? x) (string x)
+         (string x)))
   (set start-time (os/clock))
-  (eprint "\nRunning test suite " x " tests...\n  "))
+  (eprint "Starting suite " suite-name "..."))
 
 (defn end-suite []
   (def delta (- (os/clock) start-time))
-  (eprintf "\n\nTest suite %d finished in %.3f seconds" suite-num delta)
-  (eprint num-tests-passed " of " num-tests-run " tests passed.\n")
+  (eprinf "Finished suite %s in %.3f seconds - " suite-name delta)
+  (eprint num-tests-passed " of " num-tests-run " tests passed.")
   (if (not= num-tests-passed num-tests-run) (os/exit 1)))

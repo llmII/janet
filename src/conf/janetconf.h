@@ -4,10 +4,10 @@
 #define JANETCONF_H
 
 #define JANET_VERSION_MAJOR 1
-#define JANET_VERSION_MINOR 18
+#define JANET_VERSION_MINOR 33
 #define JANET_VERSION_PATCH 0
-#define JANET_VERSION_EXTRA "-dev"
-#define JANET_VERSION "1.18.0-dev"
+#define JANET_VERSION_EXTRA ""
+#define JANET_VERSION "1.33.0"
 
 /* #define JANET_BUILD "local" */
 
@@ -33,6 +33,8 @@
 /* #define JANET_NO_SYMLINKS */
 /* #define JANET_NO_UMASK */
 /* #define JANET_NO_THREADS */
+/* #define JANET_NO_FFI */
+/* #define JANET_NO_FFI_JIT */
 
 /* Other settings */
 /* #define JANET_DEBUG */
@@ -50,6 +52,9 @@
 /* #define JANET_EV_NO_EPOLL */
 /* #define JANET_EV_NO_KQUEUE */
 /* #define JANET_NO_INTERPRETER_INTERRUPT */
+/* #define JANET_NO_IPV6 */
+/* #define JANET_NO_CRYPTORAND */
+/* #define JANET_USE_STDATOMIC */
 
 /* Custom vm allocator support */
 /* #include <mimalloc.h> */

@@ -34,7 +34,11 @@ local
 
 # Common test files I use.
 temp.janet
+temp.c
+temp*janet
+temp*.c
 scratch.janet
+scratch.c
 
 # Emscripten
 *.bc
@@ -56,6 +60,7 @@ xxd.exe
 # VSCode
 .vs
 .clangd
+.cache
 
 # Swap files
 *.swp
@@ -67,9 +72,12 @@ tags
 vgcore.*
 *.out.*
 
-# Wix artifacts
+# WiX artifacts
 *.msi
 *.wixpdb
+
+# Makefile config
+/config.mk
 
 # Created by https://www.gitignore.io/api/c
 

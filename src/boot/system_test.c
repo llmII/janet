@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -69,7 +69,6 @@ int system_test() {
     Janet tuple2 = janet_wrap_tuple(janet_tuple_end(t2));
 
     assert(janet_equals(tuple1, tuple2));
-
 
     return 0;
 }

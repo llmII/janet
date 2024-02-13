@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -25,12 +25,16 @@
 #endif
 
 #include <janet.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <shlwapi.h>
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+#define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
 #endif
 #endif
 
@@ -75,6 +79,9 @@ static void simpleline(JanetBuffer *buffer) {
     int c;
     for (;;) {
         c = fgetc(in);
+        if (c < 0 && !feof(in) && errno == EINTR) {
+            continue;
+        }
         if (feof(in) || c < 0) {
             break;
         }
@@ -83,8 +90,30 @@ static void simpleline(JanetBuffer *buffer) {
     }
 }
 
-/* Windows */
-#if defined(JANET_WINDOWS) || defined(JANET_SIMPLE_GETLINE)
+/* State */
+
+#ifndef JANET_SIMPLE_GETLINE
+/* static state */
+#define JANET_LINE_MAX 1024
+#define JANET_MATCH_MAX 256
+#define JANET_HISTORY_MAX 100
+static JANET_THREAD_LOCAL int gbl_israwmode = 0;
+static JANET_THREAD_LOCAL const char *gbl_prompt = "> ";
+static JANET_THREAD_LOCAL int gbl_plen = 2;
+static JANET_THREAD_LOCAL char gbl_buf[JANET_LINE_MAX];
+static JANET_THREAD_LOCAL int gbl_len = 0;
+static JANET_THREAD_LOCAL int gbl_pos = 0;
+static JANET_THREAD_LOCAL int gbl_cols = 80;
+static JANET_THREAD_LOCAL char *gbl_history[JANET_HISTORY_MAX];
+static JANET_THREAD_LOCAL int gbl_history_count = 0;
+static JANET_THREAD_LOCAL int gbl_historyi = 0;
+static JANET_THREAD_LOCAL JanetByteView gbl_matches[JANET_MATCH_MAX];
+static JANET_THREAD_LOCAL int gbl_match_count = 0;
+static JANET_THREAD_LOCAL int gbl_lines_below = 0;
+#endif
+
+/* Fallback */
+#if defined(JANET_SIMPLE_GETLINE)
 
 void janet_line_init() {
     ;
@@ -101,6 +130,83 @@ void janet_line_get(const char *p, JanetBuffer *buffer) {
     simpleline(buffer);
 }
 
+/* Rich implementation */
+#else
+
+/* Windows */
+#ifdef _WIN32
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <io.h>
+
+static void setup_console_output(void) {
+    /* Enable color console on windows 10 console and utf8 output and other processing */
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    dwMode |= ENABLE_PROCESSED_OUTPUT;
+    SetConsoleMode(hOut, dwMode);
+    if (IsValidCodePage(65001)) {
+        SetConsoleOutputCP(65001);
+    }
+}
+
+/* Ansi terminal raw mode */
+static int rawmode(void) {
+    if (gbl_israwmode) return 0;
+    HANDLE hOut = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    dwMode &= ~ENABLE_LINE_INPUT;
+    dwMode &= ~ENABLE_INSERT_MODE;
+    dwMode &= ~ENABLE_ECHO_INPUT;
+    dwMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    dwMode &= ~ENABLE_PROCESSED_INPUT;
+    if (!SetConsoleMode(hOut, dwMode)) return 1;
+    gbl_israwmode = 1;
+    return 0;
+}
+
+/* Disable raw mode */
+static void norawmode(void) {
+    if (!gbl_israwmode) return;
+    HANDLE hOut = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    dwMode |= ENABLE_LINE_INPUT;
+    dwMode |= ENABLE_INSERT_MODE;
+    dwMode |= ENABLE_ECHO_INPUT;
+    dwMode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT;
+    dwMode |= ENABLE_PROCESSED_INPUT;
+    SetConsoleMode(hOut, dwMode);
+    gbl_israwmode = 0;
+}
+
+static long write_console(const char *bytes, size_t n) {
+    DWORD nwritten = 0;
+    BOOL result = WriteConsole(GetStdHandle(STD_OUTPUT_HANDLE), bytes, (DWORD) n, &nwritten, NULL);
+    if (!result) return -1; /* error */
+    return (long)nwritten;
+}
+
+static long read_console(char *into, size_t n) {
+    DWORD numread;
+    BOOL result = ReadConsole(GetStdHandle(STD_INPUT_HANDLE), into, (DWORD) n, &numread, NULL);
+    if (!result) return -1; /* error */
+    return (long)numread;
+}
+
+static int check_simpleline(JanetBuffer *buffer) {
+    if (!_isatty(_fileno(stdin)) || rawmode()) {
+        simpleline(buffer);
+        return 1;
+    }
+    return 0;
+}
+
 /* Posix */
 #else
 
@@ -112,7 +218,6 @@ https://github.com/antirez/linenoise/blob/master/linenoise.c
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <errno.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <sys/stat.h>
@@ -122,25 +227,7 @@ https://github.com/antirez/linenoise/blob/master/linenoise.c
 #include <string.h>
 #include <signal.h>
 
-/* static state */
-#define JANET_LINE_MAX 1024
-#define JANET_MATCH_MAX 256
-#define JANET_HISTORY_MAX 100
-static JANET_THREAD_LOCAL int gbl_israwmode = 0;
-static JANET_THREAD_LOCAL const char *gbl_prompt = "> ";
-static JANET_THREAD_LOCAL int gbl_plen = 2;
-static JANET_THREAD_LOCAL char gbl_buf[JANET_LINE_MAX];
-static JANET_THREAD_LOCAL int gbl_len = 0;
-static JANET_THREAD_LOCAL int gbl_pos = 0;
-static JANET_THREAD_LOCAL int gbl_cols = 80;
-static JANET_THREAD_LOCAL char *gbl_history[JANET_HISTORY_MAX];
-static JANET_THREAD_LOCAL int gbl_history_count = 0;
-static JANET_THREAD_LOCAL int gbl_historyi = 0;
-static JANET_THREAD_LOCAL int gbl_sigint_flag = 0;
 static JANET_THREAD_LOCAL struct termios gbl_termios_start;
-static JANET_THREAD_LOCAL JanetByteView gbl_matches[JANET_MATCH_MAX];
-static JANET_THREAD_LOCAL int gbl_match_count = 0;
-static JANET_THREAD_LOCAL int gbl_lines_below = 0;
 
 /* Unsupported terminal list from linenoise */
 static const char *badterms[] = {
@@ -149,15 +236,6 @@ static const char *badterms[] = {
     "emacs",
     NULL
 };
-
-static char *sdup(const char *s) {
-    size_t len = strlen(s) + 1;
-    char *mem = janet_malloc(len);
-    if (!mem) {
-        return NULL;
-    }
-    return memcpy(mem, s, len);
-}
 
 /* Ansi terminal raw mode */
 static int rawmode(void) {
@@ -184,13 +262,54 @@ static void norawmode(void) {
         gbl_israwmode = 0;
 }
 
+static int checktermsupport() {
+    const char *t = getenv("TERM");
+    int i;
+    if (!t) return 1;
+    for (i = 0; badterms[i]; i++)
+        if (!strcmp(t, badterms[i])) return 0;
+    return 1;
+}
+
+static long write_console(char *bytes, size_t n) {
+    return write(STDOUT_FILENO, bytes, n);
+}
+
+static long read_console(char *into, size_t n) {
+    return read(STDIN_FILENO, into, n);
+}
+
+static int check_simpleline(JanetBuffer *buffer) {
+    if (!isatty(STDIN_FILENO) || !checktermsupport()) {
+        simpleline(buffer);
+        return 1;
+    }
+    if (rawmode()) {
+        simpleline(buffer);
+        return 1;
+    }
+    return 0;
+}
+
+#endif
+
+static char *sdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *mem = janet_malloc(len);
+    if (!mem) {
+        return NULL;
+    }
+    return memcpy(mem, s, len);
+}
+
+#ifndef _WIN32
 static int curpos(void) {
     char buf[32];
     int cols, rows;
     unsigned int i = 0;
-    if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4) return -1;
+    if (write_console("\x1b[6n", 4) != 4) return -1;
     while (i < sizeof(buf) - 1) {
-        if (read(STDIN_FILENO, buf + i, 1) != 1) break;
+        if (read_console(buf + i, 1) != 1) break;
         if (buf[i] == 'R') break;
         i++;
     }
@@ -199,20 +318,26 @@ static int curpos(void) {
     if (sscanf(buf + 2, "%d;%d", &rows, &cols) != 2) return -1;
     return cols;
 }
+#endif
 
 static int getcols(void) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
+    return (int)(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+#else
     struct winsize ws;
     if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
         int start, cols;
         start = curpos();
         if (start == -1) goto failed;
-        if (write(STDOUT_FILENO, "\x1b[999C", 6) != 6) goto failed;
+        if (write_console("\x1b[999C", 6) != 6) goto failed;
         cols = curpos();
         if (cols == -1) goto failed;
         if (cols > start) {
             char seq[32];
             snprintf(seq, 32, "\x1b[%dD", cols - start);
-            if (write(STDOUT_FILENO, seq, strlen(seq)) == -1) {
+            if (write_console(seq, strlen(seq)) == -1) {
                 exit(1);
             }
         }
@@ -222,10 +347,11 @@ static int getcols(void) {
     }
 failed:
     return 80;
+#endif
 }
 
 static void clear(void) {
-    if (write(STDOUT_FILENO, "\x1b[H\x1b[2J", 7) <= 0) {
+    if (write_console("\x1b[H\x1b[2J", 7) <= 0) {
         exit(1);
     }
 }
@@ -257,7 +383,7 @@ static void refresh(void) {
     /* Move cursor to original position. */
     snprintf(seq, 64, "\r\x1b[%dC", (int)(_pos + gbl_plen));
     janet_buffer_push_cstring(&b, seq);
-    if (write(STDOUT_FILENO, b.data, b.count) == -1) {
+    if (write_console((char *) b.data, b.count) == -1) {
         exit(1);
     }
     janet_buffer_deinit(&b);
@@ -283,7 +409,7 @@ static int insert(char c, int draw) {
                 if (gbl_plen + gbl_len < gbl_cols) {
                     /* Avoid a full update of the line in the
                      * trivial case. */
-                    if (write(STDOUT_FILENO, &c, 1) == -1) return -1;
+                    if (write_console(&c, 1) == -1) return -1;
                 } else {
                     refresh();
                 }
@@ -310,7 +436,7 @@ static void historymove(int delta) {
             gbl_historyi = gbl_history_count - 1;
         }
         strncpy(gbl_buf, gbl_history[gbl_historyi], JANET_LINE_MAX - 1);
-        gbl_pos = gbl_len = strlen(gbl_buf);
+        gbl_pos = gbl_len = (int) strlen(gbl_buf);
         gbl_buf[gbl_len] = '\0';
 
         refresh();
@@ -376,10 +502,10 @@ static void kright(void) {
 }
 
 static void krightw(void) {
-    while (gbl_pos != gbl_len && !isspace(gbl_buf[gbl_pos])) {
+    while (gbl_pos != gbl_len && isspace(gbl_buf[gbl_pos])) {
         gbl_pos++;
     }
-    while (gbl_pos != gbl_len && isspace(gbl_buf[gbl_pos])) {
+    while (gbl_pos != gbl_len && !isspace(gbl_buf[gbl_pos])) {
         gbl_pos++;
     }
     refresh();
@@ -421,7 +547,6 @@ static void kdeletew(void) {
     }
     refresh();
 }
-
 
 /* See tools/symchargen.c */
 static int is_symbol_char_gen(uint8_t c) {
@@ -525,6 +650,7 @@ static void check_specials(JanetByteView src) {
     check_cmatch(src, "unquote");
     check_cmatch(src, "var");
     check_cmatch(src, "while");
+    check_cmatch(src, "upscope");
 }
 
 static void resolve_format(JanetTable *entry) {
@@ -738,12 +864,16 @@ static int line() {
 
     addhistory();
 
-    if (write(STDOUT_FILENO, gbl_prompt, gbl_plen) == -1) return -1;
+    if (write_console((char *) gbl_prompt, gbl_plen) == -1) return -1;
     for (;;) {
         char c;
         char seq[3];
 
-        if (read(STDIN_FILENO, &c, 1) <= 0) return -1;
+        int rc;
+        do {
+            rc = read_console(&c, 1);
+        } while (rc < 0 && errno == EINTR);
+        if (rc <= 0) return -1;
 
         switch (c) {
             default:
@@ -759,8 +889,13 @@ static int line() {
                 break;
             case 3:     /* ctrl-c */
                 clearlines();
-                gbl_sigint_flag = 1;
-                return -1;
+                norawmode();
+#ifdef _WIN32
+                ExitProcess(1);
+#else
+                kill(getpid(), SIGINT);
+#endif
+            /* fallthrough */
             case 17:    /* ctrl-q */
                 gbl_cancel_current_repl_form = 1;
                 clearlines();
@@ -820,23 +955,26 @@ static int line() {
             case 23: /* ctrl-w */
                 kbackspacew();
                 break;
+#ifndef _WIN32
             case 26: /* ctrl-z */
+                clearlines();
                 norawmode();
                 kill(getpid(), SIGSTOP);
                 rawmode();
                 refresh();
                 break;
+#endif
             case 27:    /* escape sequence */
                 /* Read the next two bytes representing the escape sequence.
                  * Use two calls to handle slow terminals returning the two
                  * chars at different times. */
-                if (read(STDIN_FILENO, seq, 1) == -1) break;
+                if (read_console(seq, 1) == -1) break;
                 /* Esc[ = Control Sequence Introducer (CSI) */
                 if (seq[0] == '[') {
-                    if (read(STDIN_FILENO, seq + 1, 1) == -1) break;
+                    if (read_console(seq + 1, 1) == -1) break;
                     if (seq[1] >= '0' && seq[1] <= '9') {
                         /* Extended escape, read additional byte. */
-                        if (read(STDIN_FILENO, seq + 2, 1) == -1) break;
+                        if (read_console(seq + 2, 1) == -1) break;
                         if (seq[2] == '~') {
                             switch (seq[1]) {
                                 case '1': /* Home */
@@ -855,7 +993,7 @@ static int line() {
                             }
                         }
                     } else if (seq[0] == 'O') {
-                        if (read(STDIN_FILENO, seq + 1, 1) == -1) break;
+                        if (read_console(seq + 1, 1) == -1) break;
                         switch (seq[1]) {
                             default:
                                 break;
@@ -938,35 +1076,15 @@ void janet_line_deinit() {
     gbl_historyi = 0;
 }
 
-static int checktermsupport() {
-    const char *t = getenv("TERM");
-    int i;
-    if (!t) return 1;
-    for (i = 0; badterms[i]; i++)
-        if (!strcmp(t, badterms[i])) return 0;
-    return 1;
-}
-
 void janet_line_get(const char *p, JanetBuffer *buffer) {
     gbl_prompt = p;
     buffer->count = 0;
     gbl_historyi = 0;
+    if (check_simpleline(buffer)) return;
     FILE *out = janet_dynfile("err", stderr);
-    if (!isatty(STDIN_FILENO) || !checktermsupport()) {
-        simpleline(buffer);
-        return;
-    }
-    if (rawmode()) {
-        simpleline(buffer);
-        return;
-    }
     if (line()) {
         norawmode();
-        if (gbl_sigint_flag) {
-            raise(SIGINT);
-        } else {
-            fputc('\n', out);
-        }
+        fputc('\n', out);
         return;
     }
     fflush(stdin);
@@ -977,6 +1095,13 @@ void janet_line_get(const char *p, JanetBuffer *buffer) {
     buffer->data[gbl_len] = '\n';
     buffer->count = gbl_len + 1;
     replacehistory();
+}
+
+static void clear_at_exit(void) {
+    if (!gbl_israwmode) {
+        clearlines();
+        norawmode();
+    }
 }
 
 #endif
@@ -991,18 +1116,11 @@ int main(int argc, char **argv) {
     JanetTable *env;
 
 #ifdef _WIN32
-    /* Enable color console on windows 10 console and utf8 output. */
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD dwMode = 0;
-    GetConsoleMode(hOut, &dwMode);
-    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    SetConsoleMode(hOut, dwMode);
-    SetConsoleOutputCP(65001);
+    setup_console_output();
 #endif
 
-#if !defined(JANET_WINDOWS) && !defined(JANET_SIMPLE_GETLINE)
-    /* Try and not leave the terminal in a bad state */
-    atexit(norawmode);
+#if !defined(JANET_SIMPLE_GETLINE)
+    atexit(clear_at_exit);
 #endif
 
 #if defined(JANET_PRF)

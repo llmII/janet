@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -31,6 +31,14 @@
 
 #include <stdio.h>
 #include <errno.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#ifdef JANET_EV
+#ifndef JANET_WINDOWS
+#include <pthread.h>
+#endif
+#endif
 
 #if !defined(JANET_REDUCED_OS) || !defined(JANET_SINGLE_THREADED)
 #include <time.h>
@@ -41,11 +49,11 @@
 #ifndef JANET_EXIT
 #include <stdio.h>
 #define JANET_EXIT(m) do { \
-    fprintf(stderr, "C runtime error at line %d in file %s: %s\n",\
+    fprintf(stderr, "janet internal error at line %d in file %s: %s\n",\
         __LINE__,\
         __FILE__,\
         (m));\
-    exit(1);\
+    abort();\
 } while (0)
 #endif
 
@@ -56,7 +64,10 @@
 } while (0)
 
 /* Utils */
+uint32_t janet_hash_mix(uint32_t input, uint32_t more);
 #define janet_maphash(cap, hash) ((uint32_t)(hash) & (cap - 1))
+int janet_valid_utf8(const uint8_t *str, int32_t len);
+int janet_is_symbol_char(uint8_t c);
 extern const char janet_base64[65];
 int32_t janet_array_calchash(const Janet *array, int32_t len);
 int32_t janet_kv_calchash(const JanetKV *kvs, int32_t len);
@@ -81,6 +92,12 @@ void janet_buffer_format(
     int32_t argc,
     Janet *argv);
 Janet janet_next_impl(Janet ds, Janet key, int is_interpreter);
+JanetBinding janet_binding_from_entry(Janet entry);
+JanetByteView janet_text_substitution(
+    Janet *subst,
+    const uint8_t *bytes,
+    uint32_t len,
+    JanetArray *extra_args);
 
 /* Registry functions */
 void janet_registry_put(
@@ -109,13 +126,43 @@ void janet_core_cfuns_ext(JanetTable *env, const char *regprefix, const JanetReg
 
 /* Clock gettime */
 #ifdef JANET_GETTIME
-int janet_gettime(struct timespec *spec);
+enum JanetTimeSource {
+    JANET_TIME_REALTIME,
+    JANET_TIME_MONOTONIC,
+    JANET_TIME_CPUTIME
+};
+int janet_gettime(struct timespec *spec, enum JanetTimeSource source);
 #endif
 
 /* strdup */
 #ifdef JANET_WINDOWS
 #define strdup(x) _strdup(x)
 #endif
+
+/* Use LoadLibrary on windows or dlopen on posix to load dynamic libaries
+ * with native code. */
+#if defined(JANET_NO_DYNAMIC_MODULES)
+typedef int Clib;
+#define load_clib(name) ((void) name, 0)
+#define symbol_clib(lib, sym) ((void) lib, (void) sym, NULL)
+const char *error_clib(void);
+#define free_clib(c) ((void) (c), 0)
+#elif defined(JANET_WINDOWS)
+#include <windows.h>
+typedef HINSTANCE Clib;
+void *symbol_clib(Clib clib, const char *sym);
+void free_clib(Clib clib);
+Clib load_clib(const char *name);
+char *error_clib(void);
+#else
+#include <dlfcn.h>
+typedef void *Clib;
+#define load_clib(name) dlopen((name), RTLD_NOW)
+#define free_clib(lib) dlclose((lib))
+#define symbol_clib(lib, sym) dlsym((lib), (sym))
+#define error_clib dlerror
+#endif
+char *get_processed_name(const char *name);
 
 #define RETRY_EINTR(RC, CALL) do { (RC) = CALL; } while((RC) < 0 && errno == EINTR)
 
@@ -126,6 +173,7 @@ void janet_lib_array(JanetTable *env);
 void janet_lib_tuple(JanetTable *env);
 void janet_lib_buffer(JanetTable *env);
 void janet_lib_table(JanetTable *env);
+void janet_lib_struct(JanetTable *env);
 void janet_lib_fiber(JanetTable *env);
 void janet_lib_os(JanetTable *env);
 void janet_lib_string(JanetTable *env);
@@ -153,6 +201,9 @@ extern const JanetAbstractType janet_address_type;
 void janet_lib_ev(JanetTable *env);
 void janet_ev_mark(void);
 int janet_make_pipe(JanetHandle handles[2], int mode);
+#endif
+#ifdef JANET_FFI
+void janet_lib_ffi(JanetTable *env);
 #endif
 
 #endif

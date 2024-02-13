@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -34,6 +34,19 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #endif
+#endif
+
+#ifdef JANET_WINDOWS
+#ifdef JANET_DYNAMIC_MODULES
+#include <psapi.h>
+#ifdef JANET_MSVC
+#pragma comment (lib, "Psapi.lib")
+#endif
+#endif
+#endif
+
+#ifdef JANET_APPLE
+#include <AvailabilityMacros.h>
 #endif
 
 #include <inttypes.h>
@@ -79,8 +92,8 @@ const char *const janet_signal_names[14] = {
     "user5",
     "user6",
     "user7",
-    "user8",
-    "user9"
+    "interrupt",
+    "await"
 };
 
 const char *const janet_status_names[16] = {
@@ -96,8 +109,8 @@ const char *const janet_status_names[16] = {
     "user5",
     "user6",
     "user7",
-    "user8",
-    "user9",
+    "interrupted",
+    "suspended",
     "new",
     "alive"
 };
@@ -105,6 +118,7 @@ const char *const janet_status_names[16] = {
 #ifndef JANET_PRF
 
 int32_t janet_string_calchash(const uint8_t *str, int32_t len) {
+    if (NULL == str) return 5381;
     const uint8_t *end = str + len;
     uint32_t hash = 5381;
     while (str < end)
@@ -224,13 +238,17 @@ int32_t janet_string_calchash(const uint8_t *str, int32_t len) {
 
 #endif
 
+uint32_t janet_hash_mix(uint32_t input, uint32_t more) {
+    uint32_t mix1 = (more + 0x9e3779b9 + (input << 6) + (input >> 2));
+    return input ^ (0x9e3779b9 + (mix1 << 6) + (mix1 >> 2));
+}
+
 /* Computes hash of an array of values */
 int32_t janet_array_calchash(const Janet *array, int32_t len) {
     const Janet *end = array + len;
-    uint32_t hash = 0;
+    uint32_t hash = 33;
     while (array < end) {
-        uint32_t elem = janet_hash(*array++);
-        hash ^= elem + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash = janet_hash_mix(hash, janet_hash(*array++));
     }
     return (int32_t) hash;
 }
@@ -238,10 +256,10 @@ int32_t janet_array_calchash(const Janet *array, int32_t len) {
 /* Computes hash of an array of values */
 int32_t janet_kv_calchash(const JanetKV *kvs, int32_t len) {
     const JanetKV *end = kvs + len;
-    uint32_t hash = 0;
+    uint32_t hash = 33;
     while (kvs < end) {
-        hash ^= janet_hash(kvs->key) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-        hash ^= janet_hash(kvs->value) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash = janet_hash_mix(hash, janet_hash(kvs->key));
+        hash = janet_hash_mix(hash, janet_hash(kvs->value));
         kvs++;
     }
     return (int32_t) hash;
@@ -250,6 +268,7 @@ int32_t janet_kv_calchash(const JanetKV *kvs, int32_t len) {
 /* Calculate next power of 2. May overflow. If n is 0,
  * will return 0. */
 int32_t janet_tablen(int32_t n) {
+    if (n < 0) return 0;
     n |= n >> 1;
     n |= n >> 2;
     n |= n >> 4;
@@ -480,7 +499,7 @@ typedef struct {
 static void namebuf_init(NameBuf *namebuf, const char *prefix) {
     size_t plen = strlen(prefix);
     namebuf->plen = plen;
-    namebuf->buf = janet_malloc(namebuf->plen + 256);
+    namebuf->buf = janet_smalloc(namebuf->plen + 256);
     if (NULL == namebuf->buf) {
         JANET_OUT_OF_MEMORY;
     }
@@ -489,12 +508,12 @@ static void namebuf_init(NameBuf *namebuf, const char *prefix) {
 }
 
 static void namebuf_deinit(NameBuf *namebuf) {
-    janet_free(namebuf->buf);
+    janet_sfree(namebuf->buf);
 }
 
 static char *namebuf_name(NameBuf *namebuf, const char *suffix) {
     size_t slen = strlen(suffix);
-    namebuf->buf = janet_realloc(namebuf->buf, namebuf->plen + 2 + slen);
+    namebuf->buf = janet_srealloc(namebuf->buf, namebuf->plen + 2 + slen);
     if (NULL == namebuf->buf) {
         JANET_OUT_OF_MEMORY;
     }
@@ -593,10 +612,8 @@ void janet_core_cfuns_ext(JanetTable *env, const char *regprefix, const JanetReg
 }
 #endif
 
-JanetBinding janet_resolve_ext(JanetTable *env, const uint8_t *sym) {
-    Janet ref;
+JanetBinding janet_binding_from_entry(Janet entry) {
     JanetTable *entry_table;
-    Janet entry = janet_table_get(env, janet_wrap_symbol(sym));
     JanetBinding binding = {
         JANET_BINDING_NONE,
         janet_wrap_nil(),
@@ -623,29 +640,94 @@ JanetBinding janet_resolve_ext(JanetTable *env, const uint8_t *sym) {
         binding.deprecation = JANET_BINDING_DEP_NORMAL;
     }
 
-    if (!janet_checktype(
-                janet_table_get(entry_table, janet_ckeywordv("macro")),
-                JANET_NIL)) {
-        binding.value = janet_table_get(entry_table, janet_ckeywordv("value"));
-        binding.type = JANET_BINDING_MACRO;
+    int macro = janet_truthy(janet_table_get(entry_table, janet_ckeywordv("macro")));
+    Janet value = janet_table_get(entry_table, janet_ckeywordv("value"));
+    Janet ref = janet_table_get(entry_table, janet_ckeywordv("ref"));
+    int ref_is_valid = janet_checktype(ref, JANET_ARRAY);
+    int redef = ref_is_valid && janet_truthy(janet_table_get(entry_table, janet_ckeywordv("redef")));
+
+    if (macro) {
+        binding.value = redef ? ref : value;
+        binding.type = redef ? JANET_BINDING_DYNAMIC_MACRO : JANET_BINDING_MACRO;
         return binding;
     }
 
-    ref = janet_table_get(entry_table, janet_ckeywordv("ref"));
-    if (janet_checktype(ref, JANET_ARRAY)) {
+    if (ref_is_valid) {
         binding.value = ref;
-        binding.type = JANET_BINDING_VAR;
-        return binding;
+        binding.type = redef ? JANET_BINDING_DYNAMIC_DEF : JANET_BINDING_VAR;
+    } else {
+        binding.value = value;
+        binding.type = JANET_BINDING_DEF;
     }
 
-    binding.value = janet_table_get(entry_table, janet_ckeywordv("value"));
-    binding.type = JANET_BINDING_DEF;
     return binding;
+}
+
+/* If the value at the given address can be coerced to a byte view,
+   return that byte view. If it can't, replace the value at the address
+   with the result of janet_to_string, and return a byte view over that
+   string. */
+static JanetByteView memoize_byte_view(Janet *value) {
+    JanetByteView result;
+    if (!janet_bytes_view(*value, &result.bytes, &result.len)) {
+        JanetString str = janet_to_string(*value);
+        *value = janet_wrap_string(str);
+        result.bytes = str;
+        result.len = janet_string_length(str);
+    }
+    return result;
+}
+
+static JanetByteView to_byte_view(Janet value) {
+    JanetByteView result;
+    if (!janet_bytes_view(value, &result.bytes, &result.len)) {
+        JanetString str = janet_to_string(value);
+        result.bytes = str;
+        result.len = janet_string_length(str);
+    }
+    return result;
+}
+
+JanetByteView janet_text_substitution(
+    Janet *subst,
+    const uint8_t *bytes,
+    uint32_t len,
+    JanetArray *extra_argv) {
+    int32_t extra_argc = extra_argv == NULL ? 0 : extra_argv->count;
+    JanetType type = janet_type(*subst);
+    switch (type) {
+        case JANET_FUNCTION:
+        case JANET_CFUNCTION: {
+            int32_t argc = 1 + extra_argc;
+            Janet *argv = janet_tuple_begin(argc);
+            argv[0] = janet_stringv(bytes, len);
+            for (int32_t i = 0; i < extra_argc; i++) {
+                argv[i + 1] = extra_argv->data[i];
+            }
+            janet_tuple_end(argv);
+            if (type == JANET_FUNCTION) {
+                return to_byte_view(janet_call(janet_unwrap_function(*subst), argc, argv));
+            } else {
+                return to_byte_view(janet_unwrap_cfunction(*subst)(argc, argv));
+            }
+        }
+        default:
+            return memoize_byte_view(subst);
+    }
+}
+
+JanetBinding janet_resolve_ext(JanetTable *env, const uint8_t *sym) {
+    Janet entry = janet_table_get(env, janet_wrap_symbol(sym));
+    return janet_binding_from_entry(entry);
 }
 
 JanetBindingType janet_resolve(JanetTable *env, const uint8_t *sym, Janet *out) {
     JanetBinding binding = janet_resolve_ext(env, sym);
-    *out = binding.value;
+    if (binding.type == JANET_BINDING_DYNAMIC_DEF || binding.type == JANET_BINDING_DYNAMIC_MACRO) {
+        *out = janet_array_peek(janet_unwrap_array(binding.value));
+    } else {
+        *out = binding.value;
+    }
     return binding.type;
 }
 
@@ -675,14 +757,24 @@ int janet_indexed_view(Janet seq, const Janet **data, int32_t *len) {
 /* Read both strings and buffer as unsigned character array + int32_t len.
  * Returns 1 if the view can be constructed and 0 if the type is invalid. */
 int janet_bytes_view(Janet str, const uint8_t **data, int32_t *len) {
-    if (janet_checktype(str, JANET_STRING) || janet_checktype(str, JANET_SYMBOL) ||
-            janet_checktype(str, JANET_KEYWORD)) {
+    JanetType t = janet_type(str);
+    if (t == JANET_STRING || t == JANET_SYMBOL || t == JANET_KEYWORD) {
         *data = janet_unwrap_string(str);
         *len = janet_string_length(janet_unwrap_string(str));
         return 1;
-    } else if (janet_checktype(str, JANET_BUFFER)) {
+    } else if (t == JANET_BUFFER) {
         *data = janet_unwrap_buffer(str)->data;
         *len = janet_unwrap_buffer(str)->count;
+        return 1;
+    } else if (t == JANET_ABSTRACT) {
+        void *abst = janet_unwrap_abstract(str);
+        const JanetAbstractType *atype = janet_abstract_type(abst);
+        if (NULL == atype->bytes) {
+            return 0;
+        }
+        JanetByteView view = atype->bytes(abst, janet_abstract_size(abst));
+        *data = view.bytes;
+        *len = view.len;
         return 1;
     }
     return 0;
@@ -713,11 +805,25 @@ int janet_checkint(Janet x) {
     return janet_checkintrange(dval);
 }
 
+int janet_checkuint(Janet x) {
+    if (!janet_checktype(x, JANET_NUMBER))
+        return 0;
+    double dval = janet_unwrap_number(x);
+    return janet_checkuintrange(dval);
+}
+
 int janet_checkint64(Janet x) {
     if (!janet_checktype(x, JANET_NUMBER))
         return 0;
     double dval = janet_unwrap_number(x);
     return janet_checkint64range(dval);
+}
+
+int janet_checkuint64(Janet x) {
+    if (!janet_checktype(x, JANET_NUMBER))
+        return 0;
+    double dval = janet_unwrap_number(x);
+    return janet_checkuint64range(dval);
 }
 
 int janet_checksize(Janet x) {
@@ -775,37 +881,74 @@ int32_t janet_sorted_keys(const JanetKV *dict, int32_t cap, int32_t *index_buffe
 
 /* Clock shims for various platforms */
 #ifdef JANET_GETTIME
-/* For macos */
-#ifdef __MACH__
-#include <mach/clock.h>
-#include <mach/mach.h>
-#endif
 #ifdef JANET_WINDOWS
-int janet_gettime(struct timespec *spec) {
-    FILETIME ftime;
-    GetSystemTimeAsFileTime(&ftime);
-    int64_t wintime = (int64_t)(ftime.dwLowDateTime) | ((int64_t)(ftime.dwHighDateTime) << 32);
-    /* Windows epoch is January 1, 1601 apparently */
-    wintime -= 116444736000000000LL;
-    spec->tv_sec  = wintime / 10000000LL;
-    /* Resolution is 100 nanoseconds. */
-    spec->tv_nsec = wintime % 10000000LL * 100;
+#include <profileapi.h>
+int janet_gettime(struct timespec *spec, enum JanetTimeSource source) {
+    if (source == JANET_TIME_REALTIME) {
+        FILETIME ftime;
+        GetSystemTimeAsFileTime(&ftime);
+        int64_t wintime = (int64_t)(ftime.dwLowDateTime) | ((int64_t)(ftime.dwHighDateTime) << 32);
+        /* Windows epoch is January 1, 1601 apparently */
+        wintime -= 116444736000000000LL;
+        spec->tv_sec  = wintime / 10000000LL;
+        /* Resolution is 100 nanoseconds. */
+        spec->tv_nsec = wintime % 10000000LL * 100;
+    } else if (source == JANET_TIME_MONOTONIC) {
+        LARGE_INTEGER count;
+        LARGE_INTEGER perf_freq;
+        QueryPerformanceCounter(&count);
+        QueryPerformanceFrequency(&perf_freq);
+        spec->tv_sec = count.QuadPart / perf_freq.QuadPart;
+        spec->tv_nsec = (long)((count.QuadPart % perf_freq.QuadPart) * 1000000000 / perf_freq.QuadPart);
+    } else if (source == JANET_TIME_CPUTIME) {
+        FILETIME creationTime, exitTime, kernelTime, userTime;
+        GetProcessTimes(GetCurrentProcess(), &creationTime, &exitTime, &kernelTime, &userTime);
+        int64_t tmp = ((int64_t)userTime.dwHighDateTime << 32) + userTime.dwLowDateTime;
+        spec->tv_sec = tmp / 10000000LL;
+        spec->tv_nsec = tmp % 10000000LL * 100;
+    }
     return 0;
 }
-#elif defined(__MACH__)
-int janet_gettime(struct timespec *spec) {
-    clock_serv_t cclock;
-    mach_timespec_t mts;
-    host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
-    clock_get_time(cclock, &mts);
-    mach_port_deallocate(mach_task_self(), cclock);
-    spec->tv_sec = mts.tv_sec;
-    spec->tv_nsec = mts.tv_nsec;
+/* clock_gettime() wasn't available on Mac until 10.12. */
+#elif defined(JANET_APPLE) && !defined(MAC_OS_X_VERSION_10_12)
+#include <mach/clock.h>
+#include <mach/mach.h>
+int janet_gettime(struct timespec *spec, enum JanetTimeSource source) {
+    if (source == JANET_TIME_REALTIME) {
+        clock_serv_t cclock;
+        mach_timespec_t mts;
+        host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
+        clock_get_time(cclock, &mts);
+        mach_port_deallocate(mach_task_self(), cclock);
+        spec->tv_sec = mts.tv_sec;
+        spec->tv_nsec = mts.tv_nsec;
+    } else if (source == JANET_TIME_MONOTONIC) {
+        clock_serv_t cclock;
+        int nsecs;
+        mach_msg_type_number_t count;
+        host_get_clock_service(mach_host_self(), clock, &cclock);
+        clock_get_attributes(cclock, CLOCK_GET_TIME_RES, (clock_attr_t)&nsecs, &count);
+        mach_port_deallocate(mach_task_self(), cclock);
+        clock_getres(CLOCK_MONOTONIC, spec);
+    }
+    if (source == JANET_TIME_CPUTIME) {
+        clock_t tmp = clock();
+        spec->tv_sec = tmp;
+        spec->tv_nsec = (tmp - spec->tv_sec) * 1.0e9;
+    }
     return 0;
 }
 #else
-int janet_gettime(struct timespec *spec) {
-    return clock_gettime(CLOCK_REALTIME, spec);
+int janet_gettime(struct timespec *spec, enum JanetTimeSource source) {
+    clockid_t cid = CLOCK_REALTIME;
+    if (source == JANET_TIME_REALTIME) {
+        cid = CLOCK_REALTIME;
+    } else if (source == JANET_TIME_MONOTONIC) {
+        cid = CLOCK_MONOTONIC;
+    } else if (source == JANET_TIME_CPUTIME) {
+        cid = CLOCK_PROCESS_CPUTIME_ID;
+    }
+    return clock_gettime(cid, spec);
 }
 #endif
 #endif
@@ -817,18 +960,22 @@ void arc4random_buf(void *buf, size_t nbytes);
 #endif
 
 int janet_cryptorand(uint8_t *out, size_t n) {
+#ifndef JANET_NO_CRYPTORAND
 #ifdef JANET_WINDOWS
     for (size_t i = 0; i < n; i += sizeof(unsigned int)) {
         unsigned int v;
         if (rand_s(&v))
             return -1;
-        for (int32_t j = 0; (j < sizeof(unsigned int)) && (i + j < n); j++) {
+        for (int32_t j = 0; (j < (int32_t) sizeof(unsigned int)) && (i + j < n); j++) {
             out[i + j] = v & 0xff;
             v = v >> 8;
         }
     }
     return 0;
-#elif defined(JANET_LINUX) || ( defined(JANET_APPLE) && !defined(MAC_OS_X_VERSION_10_7) )
+#elif defined(JANET_BSD) || defined(MAC_OS_X_VERSION_10_7)
+    arc4random_buf(out, n);
+    return 0;
+#else
     /* We should be able to call getrandom on linux, but it doesn't seem
        to be uniformly supported on linux distros.
        On Mac, arc4random_buf wasn't available on until 10.7.
@@ -850,16 +997,89 @@ int janet_cryptorand(uint8_t *out, size_t n) {
     }
     RETRY_EINTR(rc, close(randfd));
     return 0;
-#elif defined(JANET_BSD) || defined(MAC_OS_X_VERSION_10_7)
-    arc4random_buf(out, n);
-    return 0;
+#endif
 #else
-    (void) n;
     (void) out;
+    (void) n;
     return -1;
 #endif
 }
 
+/* Dynamic library loading */
+
+char *get_processed_name(const char *name) {
+    if (name[0] == '.') return (char *) name;
+    const char *c;
+    for (c = name; *c; c++) {
+        if (*c == '/') return (char *) name;
+    }
+    size_t l = (size_t)(c - name);
+    char *ret = janet_malloc(l + 3);
+    if (NULL == ret) {
+        JANET_OUT_OF_MEMORY;
+    }
+    ret[0] = '.';
+    ret[1] = '/';
+    memcpy(ret + 2, name, l + 1);
+    return ret;
+}
+
+#if defined(JANET_NO_DYNAMIC_MODULES)
+
+const char *error_clib(void) {
+    return "dynamic modules not supported";
+}
+
+#else
+#if defined(JANET_WINDOWS)
+
+static char error_clib_buf[256];
+char *error_clib(void) {
+    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                   NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                   error_clib_buf, sizeof(error_clib_buf), NULL);
+    error_clib_buf[strlen(error_clib_buf) - 1] = '\0';
+    return error_clib_buf;
+}
+
+Clib load_clib(const char *name) {
+    if (name == NULL) {
+        return GetModuleHandle(NULL);
+    } else {
+        return LoadLibrary(name);
+    }
+}
+
+void free_clib(HINSTANCE clib) {
+    if (clib != GetModuleHandle(NULL)) {
+        FreeLibrary(clib);
+    }
+}
+
+void *symbol_clib(HINSTANCE clib, const char *sym) {
+    if (clib != GetModuleHandle(NULL)) {
+        return GetProcAddress(clib, sym);
+    } else {
+        /* Look up symbols from all loaded modules */
+        HMODULE hMods[1024];
+        DWORD needed = 0;
+        if (EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &needed)) {
+            needed /= sizeof(HMODULE);
+            for (DWORD i = 0; i < needed; i++) {
+                void *address = GetProcAddress(hMods[i], sym);
+                if (NULL != address) {
+                    return address;
+                }
+            }
+        } else {
+            janet_panicf("ffi: %s", error_clib());
+        }
+        return NULL;
+    }
+}
+
+#endif
+#endif
 
 /* Alloc function macro fills */
 void *(janet_malloc)(size_t size) {

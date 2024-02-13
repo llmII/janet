@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -69,6 +69,7 @@ typedef enum {
 #define JANET_FUN_REMAINDER 30
 #define JANET_FUN_CMP 31
 #define JANET_FUN_CANCEL 32
+#define JANET_FUN_DIVIDE_FLOOR 33
 
 /* Compiler typedefs */
 typedef struct JanetCompiler JanetCompiler;
@@ -111,13 +112,21 @@ struct JanetSlot {
 typedef struct SymPair {
     JanetSlot slot;
     const uint8_t *sym;
+    const uint8_t *sym2;
     int keep;
+    uint32_t birth_pc;
+    uint32_t death_pc;
 } SymPair;
+
+typedef struct JanetEnvRef {
+    int32_t envindex;
+    JanetScope *scope;
+} JanetEnvRef;
 
 /* A lexical scope during compilation */
 struct JanetScope {
 
-    /* For debugging */
+    /* For debugging the compiler */
     const char *name;
 
     /* Scopes are doubly linked list */
@@ -133,7 +142,7 @@ struct JanetScope {
     /* FuncDefs */
     JanetFuncDef **defs;
 
-    /* Regsiter allocator */
+    /* Register allocator */
     JanetcRegisterAllocator ra;
 
     /* Upvalue allocator */
@@ -142,7 +151,7 @@ struct JanetScope {
     /* Referenced closure environments. The values at each index correspond
      * to which index to get the environment from in the parent. The environment
      * that corresponds to the direct parent's stack will always have value 0. */
-    int32_t *envs;
+    JanetEnvRef *envs;
 
     int32_t bytecode_start;
     int flags;
@@ -179,6 +188,7 @@ struct JanetCompiler {
 #define JANET_FOPTS_TAIL 0x10000
 #define JANET_FOPTS_HINT 0x20000
 #define JANET_FOPTS_DROP 0x40000
+#define JANET_FOPTS_ACCEPT_SPLICE 0x80000
 
 /* Options for compiling a single form */
 struct JanetFopts {
@@ -227,7 +237,7 @@ JanetSlot *janetc_toslots(JanetCompiler *c, const Janet *vals, int32_t len);
 /* Get a bunch of slots for function arguments */
 JanetSlot *janetc_toslotskv(JanetCompiler *c, Janet ds);
 
-/* Push slots load via janetc_toslots. */
+/* Push slots loaded via janetc_toslots. */
 int32_t janetc_pushslots(JanetCompiler *c, JanetSlot *slots);
 
 /* Free slots loaded via janetc_toslots */
@@ -257,5 +267,9 @@ JanetSlot janetc_cslot(Janet x);
 
 /* Search for a symbol */
 JanetSlot janetc_resolve(JanetCompiler *c, const uint8_t *sym);
+
+/* Bytecode optimization */
+void janet_bytecode_movopt(JanetFuncDef *def);
+void janet_bytecode_remove_noops(JanetFuncDef *def);
 
 #endif

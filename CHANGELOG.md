@@ -1,7 +1,238 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
-## Unreleased - ???
+## Unreleased - 2024-02-??
+- Add a new (split) PEG special by @ianthehenry
+- Add buffer/push-* sized int and float by @pnelson
+
+## 1.33.0 - 2024-01-07
+- Add more + and * keywords to default-peg-grammar by @sogaiu.
+- Use libc strlen in janet_buffer_push_cstring by @williewillus.
+- Be a bit safer with reference counting.
+- Add support for atomic loads in Janet's atomic abstraction.
+- Fix poll event loop CPU usage issue.
+- Add ipv6, shared, and cryptorand options to meson.
+- Add more ipv6 feature detection.
+- Fix loop for forever loop.
+- Cleaned up unused NetStateConnect, fixed janet_async_end() ev refcount by @zevv.
+- Fix warnings w/ MSVC and format.
+- Fix marshal_one_env w/ JANET_MARSHAL_UNSAFE.
+- Fix `(default)`.
+- Fix cannot marshal fiber with c stackframe, in a dynamic way that is fairly conservative.
+- Fix typo for SIGALARM in os/proc-kill.
+- Prevent bytecode optimization from remove mk* instructions.
+- Fix arity typo in peg.c by @pepe.
+- Update Makefile for MinGW.
+- Fix canceling waiting fiber.
+- Add a new (sub) PEG special by @ianthehenry.
+- Fix if net/server's handler has incorrect arity.
+- Fix macex raising on ().
+
+## 1.32.1 - 2023-10-15
+- Fix return value from C function `janet_dobytes` when called on Janet functions that yield to event loop.
+- Change C API for event loop interaction - get rid of JanetListener and instead use `janet_async_start` and `janet_async_end`.
+- Rework event loop to make fewer system calls on kqueue and epoll.
+- Expose atomic refcount abstraction in janet.h
+- Add `array/weak` for weak references in arrays
+- Add support for weak tables via `table/weak`, `table/weak-keys`, and `table/weak-values`.
+- Fix compiler bug with using the result of `(break x)` expression in some contexts.
+- Rework internal event loop code to be better behaved on Windows
+- Update meson build to work better on windows
+
+## 1.31.0 - 2023-09-17
+- Report line and column when using `janet_dobytes`
+- Add `:unless` loop modifier
+- Allow calling `reverse` on generators.
+- Improve performance of a number of core functions including `partition`, `mean`, `keys`, `values`, `pairs`, `interleave`.
+- Add `lengthable?`
+- Add `os/sigaction`
+- Change `every?` and `any?` to behave like the functional versions of the `and` and `or` macros.
+- Fix bug with garbage collecting threaded abstract types.
+- Add `:signal` to the `sandbox` function to allow intercepting signals.
+
+## 1.30.0 - 2023-08-05
+- Change indexing of `array/remove` to start from -1 at the end instead of -2.
+- Add new string escape sequences `\\a`, `\\b`, `\\?`, and `\\'`.
+- Fix bug with marshalling channels
+- Add `div` for floored division
+- Make `div` and `mod` variadic
+- Support `bnot` for integer types.
+- Define `(mod x 0)` as `x`
+- Add `ffi/pointer-cfunction` to convert pointers to cfunctions
+
+## 1.29.1 - 2023-06-19
+- Add support for passing booleans to PEGs for "always" and "never" matching.
+- Allow dictionary types for `take` and `drop`
+- Fix bug with closing channels while other fibers were waiting on them - `ev/take`, `ev/give`, and `ev/select`  will now return the correct (documented) value when another fiber closes the channel.
+- Add `ffi/calling-conventions` to show all available calling conventions for FFI.
+- Add `net/setsockopt`
+- Add `signal` argument to `os/proc-kill` to send signals besides `SIGKILL` on Posix.
+- Add `source` argument to `os/clock` to get different time sources.
+- Various combinator functions now are variadic like `map`
+- Add `file/lines` to iterate over lines in a file lazily.
+- Reorganize test suite to be sorted by module rather than pseudo-randomly.
+- Add `*task-id*`
+- Add `env` argument to `fiber/new`.
+- Add `JANET_NO_AMALG` flag to Makefile to properly incremental builds
+- Optimize bytecode compiler to generate fewer instructions and improve loops.
+- Fix bug with `ev/gather` and hung fibers.
+- Add `os/isatty`
+- Add `has-key?` and `has-value?`
+- Make imperative arithmetic macros variadic
+- `ev/connect` now yields to the event loop instead of blocking while waiting for an ACK.
+
+## 1.28.0 - 2023-05-13
+- Various bug fixes
+- Make nested short-fn's behave a bit more predictably (it is still not recommended to nest short-fns).
+- Add `os/strftime` for date formatting.
+- Fix `ev/select` on threaded channels sometimes live-locking.
+- Support the `NO_COLOR` environment variable to turn off VT100 color codes in repl (and in scripts).
+  See http://no-color.org/
+- Disallow using `(splice x)` in contexts where it doesn't make sense rather than silently coercing to `x`.
+  Instead, raise a compiler error.
+- Change the names of `:user8` and `:user9` sigals to `:interrupt` and `:await`
+- Change the names of `:user8` and `:user9` fiber statuses to `:interrupted` and `:suspended`.
+- Add `ev/all-tasks` to see all currently suspended fibers.
+- Add `keep-syntax` and `keep-syntax!` functions to make writing macros easier.
+
+## 1.27.0 - 2023-03-05
+- Change semantics around bracket tuples to no longer be equal to regular tuples.
+- Add `index` argument to `ffi/write` for symmetry with `ffi/read`.
+- Add `buffer/push-at`
+- Add `ffi/pointer-buffer` to convert pointers to buffers the cannot be reallocated. This
+  allows easier manipulation of FFI memory, memory mapped files, and buffer memory shared between threads.
+- Calling `ev/cancel` on a fiber waiting on `ev/gather` will correctly
+  cancel the child fibers.
+- Add `(sandbox ...)` function to core for permission based security. Also add `janet_sandbox` to C API.
+  The sandbox allows limiting access to the file system, network, ffi, and OS resources at runtime.
+- Add `(.locals)` function to debugger to see currently bound local symbols.
+- Track symbol -> slot mapping so debugger can get symbolic information. This exposes local bindings
+  in `debug/stack` and `disasm`.
+- Add `os/compiler` to detect what host compiler was used to compile the interpreter
+- Add support for mingw and cygwin builds (mingw support also added in jpm).
+
+## 1.26.0 - 2023-01-07
+- Add `ffi/malloc` and `ffi/free`. Useful as tools of last resort.
+- Add `ffi/jitfn` to allow calling function pointers generated at runtime from machine code.
+  Bring your own assembler, though.
+- Channels can now be marshalled. Pending state is not saved, only items in the channel.
+- Use the new `.length` function pointer on abstract types for lengths. Adding
+  a `length` method will still work as well.
+- Support byte views on abstract types with the `.bytes` function pointer.
+- Add the `u` format specifier to printf family functions.
+- Allow printing 64 integer types in `printf` and `string/format` family functions.
+- Allow importing modules from custom directories more easily with the `@` prefix
+  to module paths. For example, if there is a dynamic binding :custom-modules that
+  is a file system path to a directory of modules, import from that directory with
+  `(import @custom-modules/mymod)`.
+- Fix error message bug in FFI library.
+
+## 1.25.1 - 2022-10-29
+- Add `memcmp` function to core library.
+- Fix bug in `os/open` with `:rw` permissions not correct on Linux.
+- Support config.mk for more easily configuring the Makefile.
+
+## 1.25.0 - 2022-10-10
+- Windows FFI fixes.
+- Fix PEG `if-not` combinator with captures in the condition
+- Fix bug with `os/date` with nil first argument
+- Fix bug with `net/accept` on Linux that could leak file descriptors to subprocesses
+- Reduce number of hash collisions from pointer hashing
+- Add optional parameter to `marshal` to skip cycle checking code
+
+## 1.24.1 - 2022-08-24
+- Fix FFI bug on Linux/Posix
+- Improve parse error messages for bad delimiters.
+- Add optional `name` parameter to the `short-fn` macro.
+
+## 1.24.0 - 2022-08-14
+- Add FFI support to 64-bit windows compiled with MSVC
+- Don't process shared object names passed to dlopen.
+- Add better support for windows console in the default shell.c for auto-completion and
+  other shell-like input features.
+- Improve default error message from `assert`.
+- Add the `tabseq` macro for simpler table comprehensions.
+- Allow setting `(dyn :task-id)` in fibers to improve context in supervisor messages. Prior to
+  this change, supervisor messages over threaded channels would be from ambiguous threads/fibers.
+
+## 1.23.0 - 2022-06-20
+- Add experimental `ffi/` module for interfacing with dynamic libraries and raw function pointers. Only available
+  on 64 bit linux, mac, and bsd systems.
+- Allow using `&named` in function prototypes for named arguments. This is a more ergonomic
+  variant of `&keys` that isn't as redundant, more self documenting, and allows extension to
+  things like default arguments.
+- Add `delay` macro for lazy evaluate-and-save thunks.
+- Remove pthread.h from janet.h for easier includes.
+- Add `debugger` - an easy to use debugger function that just takes a fiber.
+- `dofile` will now start a debugger on errors if the environment it is passed has `:debug` set.
+- Add `debugger-on-status` function, which can be passed to `run-context` to start a debugger on
+  abnormal fiber signals.
+- Allow running scripts with the `-d` flag to use the built-in debugger on errors and breakpoints.
+- Add mutexes (locks) and reader-writer locks to ev module for thread coordination.
+- Add `parse-all` as a generalization of the `parse` function.
+- Add `os/cpu-count` to get the number of available processors on a machine
+
+## 1.22.0 - 2022-05-09
+- Prohibit negative size argument to `table/new`.
+- Add `module/value`.
+- Remove `file/popen`. Use `os/spawn` with the `:pipe` options instead.
+- Fix bug in peg `thru` and `to` combinators.
+- Fix printing issue in `doc` macro.
+- Numerous updates to function docstrings
+- Add `defdyn` aliases for various dynamic bindings used in core.
+- Install `janet.h` symlink to make Janet native libraries and applications
+  easier to build without `jpm`.
+
+## 1.21.2 - 2022-04-01
+- C functions `janet_dobytes` and `janet_dostring` will now enter the event loop if it is enabled.
+- Fix hashing regression - hash of negative 0 must be the same as positive 0 since they are equal.
+- The `flycheck` function no longer pollutes the module/cache
+- Fix quasiquote bug in compiler
+- Disallow use of `cancel` and `resume` on fibers scheduled or created with `ev/go`, as well as the root
+  fiber.
+
+## 1.20.0 - 2022-1-27
+- Add `:missing-symbol` hook to `compile` that will act as a catch-all macro for undefined symbols.
+- Add `:redef` dynamic binding that will allow users to redefine top-level bindings with late binding. This
+  is intended for development use.
+- Fix a bug with reading from a stream returned by `os/open` on Windows and Linux.
+- Add `:ppc64` as a detectable OS type.
+- Add `& more` support for destructuring in the match macro.
+- Add `& more` support for destructuring in all binding forms (`def`).
+
+## 1.19.2 - 2021-12-06
+- Fix bug with missing status lines in some stack traces.
+- Update hash function to have better statistical properties.
+
+## 1.19.1 - 2021-12-04
+- Add an optional `prefix` parameter to `debug/stacktrace` to allow printing prettier error messages.
+- Remove appveyor for CI pipeline
+- Fixed a bug that prevented sending threaded abstracts over threaded channels.
+- Fix bug in the `map` function with arity at least 3.
+
+## 1.19.0 - 2021-11-27
+- Add `math/log-gamma` to replace `math/gamma`, and change `math/gamma` to be the expected gamma function.
+- Fix leaking file-descriptors in os/spawn and os/execute.
+- Ctrl-C will now raise SIGINT.
+- Allow quoted literals in the `match` macro to behave as expected in patterns.
+- Fix windows net related bug for TCP servers.
+- Allow evaluating ev streams with dofile.
+- Fix `ev` related bug with operations on already closed file descriptors.
+- Add struct and table agnostic `getproto` function.
+- Add a number of functions related to structs.
+- Add prototypes to structs. Structs can now inherit from other structs, just like tables.
+- Create a struct with a prototype with `struct/with-proto`.
+- Deadlocked channels will no longer exit early - instead they will hang, which is more intuitive.
+
+## 1.18.1 - 2021-10-16
+- Fix some documentation typos
+- Fix - Set pipes passed to subprocess to blocking mode.
+- Fix `-r` switch in repl.
+
+## 1.18.0 - 2021-10-10
+- Allow `ev/cancel` to work on already scheduled fibers.
+- Fix bugs with ev/ module.
+- Add optional `base` argument to scan-number
 - Add `-i` flag to janet binary to make it easier to run image files from the command line
 - Remove `thread/` module.
 - Add `(number ...)` pattern to peg for more efficient number parsing using Janet's

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -57,6 +57,10 @@ enum JanetMemoryType {
     JANET_MEMORY_FUNCENV,
     JANET_MEMORY_FUNCDEF,
     JANET_MEMORY_THREADED_ABSTRACT,
+    JANET_MEMORY_TABLE_WEAKK,
+    JANET_MEMORY_TABLE_WEAKV,
+    JANET_MEMORY_TABLE_WEAKKV,
+    JANET_MEMORY_ARRAY_WEAK
 };
 
 /* To allocate collectable memory, one must call janet_alloc, initialize the memory,

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -37,6 +37,7 @@ typedef struct {
     JanetFuncEnv **seen_envs;
     JanetFuncDef **seen_defs;
     int32_t nextid;
+    int maybe_cycles;
 } MarshalState;
 
 /* Lead bytes in marshaling protocol */
@@ -64,8 +65,10 @@ enum {
     LB_FUNCDEF_REF, /* 220 */
     LB_UNSAFE_CFUNCTION, /* 221 */
     LB_UNSAFE_POINTER, /* 222 */
+    LB_STRUCT_PROTO, /* 223 */
 #ifdef JANET_EV
-    LB_THREADED_ABSTRACT/* 223 */
+    LB_THREADED_ABSTRACT, /* 224 */
+    LB_POINTER_BUFFER, /* 224 */
 #endif
 } LeadBytes;
 
@@ -151,6 +154,10 @@ static void pushbytes(MarshalState *st, const uint8_t *bytes, int32_t len) {
     janet_buffer_push_bytes(st->buf, bytes, len);
 }
 
+static void pushpointer(MarshalState *st, const void *ptr) {
+    janet_buffer_push_bytes(st->buf, (const uint8_t *) &ptr, sizeof(ptr));
+}
+
 /* Marshal a size_t onto the buffer */
 static void push64(MarshalState *st, uint64_t x) {
     if (x <= 0xF0) {
@@ -178,6 +185,19 @@ static void marshal_one_env(MarshalState *st, JanetFuncEnv *env, int flags);
 /* Prevent stack overflows */
 #define MARSH_STACKCHECK if ((flags & 0xFFFF) > JANET_RECURSION_GUARD) janet_panic("stack overflow")
 
+/* Quick check if a fiber cannot be marshalled. This is will
+ * have no false positives, but may have false negatives. */
+static int fiber_cannot_be_marshalled(JanetFiber *fiber) {
+    if (janet_fiber_status(fiber) == JANET_STATUS_ALIVE) return 1;
+    int32_t i = fiber->frame;
+    while (i > 0) {
+        JanetStackFrame *frame = (JanetStackFrame *)(fiber->data + i - JANET_FRAME_SIZE);
+        if (!frame->func) return 1; /* has cfunction on stack */
+        i = frame->prevframe;
+    }
+    return 0;
+}
+
 /* Marshal a function env */
 static void marshal_one_env(MarshalState *st, JanetFuncEnv *env, int flags) {
     MARSH_STACKCHECK;
@@ -190,7 +210,9 @@ static void marshal_one_env(MarshalState *st, JanetFuncEnv *env, int flags) {
     }
     janet_env_valid(env);
     janet_v_push(st->seen_envs, env);
-    if (env->offset > 0 && (JANET_STATUS_ALIVE == janet_fiber_status(env->as.fiber))) {
+
+    /* Special case for early detachment */
+    if (env->offset > 0 && fiber_cannot_be_marshalled(env->as.fiber)) {
         pushint(st, 0);
         pushint(st, env->length);
         Janet *values = env->as.fiber->data + env->offset;
@@ -239,6 +261,7 @@ static void marshal_one_def(MarshalState *st, JanetFuncDef *def, int flags) {
     }
     /* Add to lookup */
     janet_v_push(st->seen_defs, def);
+
     pushint(st, def->flags);
     pushint(st, def->slotcount);
     pushint(st, def->arity);
@@ -250,6 +273,8 @@ static void marshal_one_def(MarshalState *st, JanetFuncDef *def, int flags) {
         pushint(st, def->environments_length);
     if (def->flags & JANET_FUNCDEF_FLAG_HASDEFS)
         pushint(st, def->defs_length);
+    if (def->flags & JANET_FUNCDEF_FLAG_HASSYMBOLMAP)
+        pushint(st, def->symbolmap_length);
     if (def->flags & JANET_FUNCDEF_FLAG_HASNAME)
         marshal_one(st, janet_wrap_string(def->name), flags);
     if (def->flags & JANET_FUNCDEF_FLAG_HASSOURCE)
@@ -257,7 +282,15 @@ static void marshal_one_def(MarshalState *st, JanetFuncDef *def, int flags) {
 
     /* marshal constants */
     for (int32_t i = 0; i < def->constants_length; i++)
-        marshal_one(st, def->constants[i], flags);
+        marshal_one(st, def->constants[i], flags + 1);
+
+    /* Marshal symbol map, if needed */
+    for (int32_t i = 0; i < def->symbolmap_length; i++) {
+        pushint(st, (int32_t) def->symbolmap[i].birth_pc);
+        pushint(st, (int32_t) def->symbolmap[i].death_pc);
+        pushint(st, (int32_t) def->symbolmap[i].slot_index);
+        marshal_one(st, janet_wrap_symbol(def->symbolmap[i].symbol), flags + 1);
+    }
 
     /* marshal the bytecode */
     janet_marshal_u32s(st, def->bytecode, def->bytecode_length);
@@ -268,7 +301,7 @@ static void marshal_one_def(MarshalState *st, JanetFuncDef *def, int flags) {
 
     /* marshal the sub funcdefs if needed */
     for (int32_t i = 0; i < def->defs_length; i++)
-        marshal_one_def(st, def->defs[i], flags);
+        marshal_one_def(st, def->defs[i], flags + 1);
 
     /* marshal source maps if needed */
     if (def->flags & JANET_FUNCDEF_FLAG_HASSOURCEMAP) {
@@ -310,7 +343,7 @@ static void marshal_one_fiber(MarshalState *st, JanetFiber *fiber, int flags) {
     while (i > 0) {
         JanetStackFrame *frame = (JanetStackFrame *)(fiber->data + i - JANET_FRAME_SIZE);
         if (frame->env) frame->flags |= JANET_STACKFRAME_HASENV;
-        if (!frame->func) janet_panic("cannot marshal fiber with c stackframe");
+        if (!frame->func) janet_panicf("cannot marshal fiber with c stackframe (%v)", janet_wrap_cfunction((JanetCFunction) frame->pc));
         pushint(st, frame->flags);
         pushint(st, frame->prevframe);
         int32_t pcdiff = (int32_t)(frame->pc - frame->func->def->bytecode);
@@ -345,6 +378,15 @@ void janet_marshal_int(JanetMarshalContext *ctx, int32_t value) {
     pushint(st, value);
 }
 
+/* Only use in unsafe - don't marshal pointers otherwise */
+void janet_marshal_ptr(JanetMarshalContext *ctx, const void *ptr) {
+    if (!(ctx->flags & JANET_MARSHAL_UNSAFE)) {
+        janet_panic("can only marshal pointers in unsafe mode");
+    }
+    MarshalState *st = (MarshalState *)(ctx->m_state);
+    pushpointer(st, ptr);
+}
+
 void janet_marshal_byte(JanetMarshalContext *ctx, uint8_t value) {
     MarshalState *st = (MarshalState *)(ctx->m_state);
     pushbyte(st, value);
@@ -361,15 +403,26 @@ void janet_marshal_janet(JanetMarshalContext *ctx, Janet x) {
     marshal_one(st, x, ctx->flags + 1);
 }
 
+#ifdef JANET_MARSHAL_DEBUG
+#define MARK_SEEN() \
+    do { if (st->maybe_cycles) { \
+        Janet _check = janet_table_get(&st->seen, x); \
+        if (!janet_checktype(_check, JANET_NIL)) janet_eprintf("double MARK_SEEN on %v\n", x); \
+        janet_eprintf("made reference %d (%t) to %v\n", st->nextid, x, x); \
+        janet_table_put(&st->seen, x, janet_wrap_integer(st->nextid++)); \
+    } } while (0)
+#else
+#define MARK_SEEN() \
+    do { if (st->maybe_cycles) { \
+        janet_table_put(&st->seen, x, janet_wrap_integer(st->nextid++)); \
+    } } while (0)
+#endif
+
 void janet_marshal_abstract(JanetMarshalContext *ctx, void *abstract) {
     MarshalState *st = (MarshalState *)(ctx->m_state);
-    janet_table_put(&st->seen,
-                    janet_wrap_abstract(abstract),
-                    janet_wrap_integer(st->nextid++));
+    Janet x = janet_wrap_abstract(abstract);
+    MARK_SEEN();
 }
-
-#define MARK_SEEN() \
-    janet_table_put(&st->seen, x, janet_wrap_integer(st->nextid++))
 
 static void marshal_one_abstract(MarshalState *st, Janet x, int flags) {
     void *abstract = janet_unwrap_abstract(x);
@@ -392,7 +445,7 @@ static void marshal_one_abstract(MarshalState *st, Janet x, int flags) {
     if (at->marshal) {
         pushbyte(st, LB_ABSTRACT);
         marshal_one(st, janet_csymbolv(at->name), flags + 1);
-        JanetMarshalContext context = {st, NULL, flags, NULL, at};
+        JanetMarshalContext context = {st, NULL, flags + 1, NULL, at};
         at->marshal(abstract, &context);
     } else {
         janet_panicf("cannot marshal %p", x);
@@ -427,11 +480,14 @@ static void marshal_one(MarshalState *st, Janet x, int flags) {
 
     /* Check reference and registry value */
     {
-        Janet check = janet_table_get(&st->seen, x);
-        if (janet_checkint(check)) {
-            pushbyte(st, LB_REFERENCE);
-            pushint(st, janet_unwrap_integer(check));
-            return;
+        Janet check;
+        if (st->maybe_cycles) {
+            check = janet_table_get(&st->seen, x);
+            if (janet_checkint(check)) {
+                pushbyte(st, LB_REFERENCE);
+                pushint(st, janet_unwrap_integer(check));
+                return;
+            }
         }
         if (st->rreg) {
             check = janet_table_get(st->rreg, x);
@@ -494,6 +550,16 @@ static void marshal_one(MarshalState *st, Janet x, int flags) {
             JanetBuffer *buffer = janet_unwrap_buffer(x);
             /* Record reference */
             MARK_SEEN();
+#ifdef JANET_EV
+            if ((flags & JANET_MARSHAL_UNSAFE) &&
+                    (buffer->gc.flags & JANET_BUFFER_FLAG_NO_REALLOC)) {
+                pushbyte(st, LB_POINTER_BUFFER);
+                pushint(st, buffer->count);
+                pushint(st, buffer->capacity);
+                pushpointer(st, buffer->data);
+                return;
+            }
+#endif
             pushbyte(st, LB_BUFFER);
             pushint(st, buffer->count);
             pushbytes(st, buffer->data, buffer->count);
@@ -542,8 +608,10 @@ static void marshal_one(MarshalState *st, Janet x, int flags) {
             int32_t count;
             const JanetKV *struct_ = janet_unwrap_struct(x);
             count = janet_struct_length(struct_);
-            pushbyte(st, LB_STRUCT);
+            pushbyte(st, janet_struct_proto(struct_) ? LB_STRUCT_PROTO : LB_STRUCT);
             pushint(st, count);
+            if (janet_struct_proto(struct_))
+                marshal_one(st, janet_wrap_struct(janet_struct_proto(struct_)), flags + 1);
             for (int32_t i = 0; i < janet_struct_capacity(struct_); i++) {
                 if (janet_checktype(struct_[i].key, JANET_NIL))
                     continue;
@@ -587,8 +655,7 @@ static void marshal_one(MarshalState *st, Janet x, int flags) {
             if (!(flags & JANET_MARSHAL_UNSAFE)) goto no_registry;
             MARK_SEEN();
             pushbyte(st, LB_UNSAFE_POINTER);
-            void *ptr = janet_unwrap_pointer(x);
-            pushbytes(st, (uint8_t *) &ptr, sizeof(void *));
+            pushpointer(st, janet_unwrap_pointer(x));
             return;
         }
     no_registry:
@@ -610,6 +677,7 @@ void janet_marshal(
     st.seen_defs = NULL;
     st.seen_envs = NULL;
     st.rreg = rreg;
+    st.maybe_cycles = !(flags & JANET_MARSHAL_NO_CYCLES);
     janet_table_init(&st.seen, 0);
     marshal_one(&st, x, flags);
     janet_table_deinit(&st.seen);
@@ -694,9 +762,22 @@ static uint64_t read64(UnmarshalState *st, const uint8_t **atdata) {
     return ret;
 }
 
+#ifdef JANET_MARSHAL_DEBUG
+static void dump_reference_table(UnmarshalState *st) {
+    for (int32_t i = 0; i < janet_v_count(st->lookup); i++) {
+        janet_eprintf("  reference %d (%t) = %v\n", i, st->lookup[i], st->lookup[i]);
+    }
+}
+#endif
+
 /* Assert a janet type */
-static void janet_asserttype(Janet x, JanetType t) {
+static void janet_asserttype(Janet x, JanetType t, UnmarshalState *st) {
     if (!janet_checktype(x, t)) {
+#ifdef JANET_MARSHAL_DEBUG
+        dump_reference_table(st);
+#else
+        (void) st;
+#endif
         janet_panicf("expected type %T, got %v", 1 << t, x);
     }
 }
@@ -748,7 +829,7 @@ static const uint8_t *unmarshal_one_env(
             Janet fiberv;
             /* On stack variant */
             data = unmarshal_one(st, data, &fiberv, flags);
-            janet_asserttype(fiberv, JANET_FIBER);
+            janet_asserttype(fiberv, JANET_FIBER, st);
             env->as.fiber = janet_unwrap_fiber(fiberv);
             /* Negative offset indicates untrusted input */
             env->offset = -offset;
@@ -814,6 +895,8 @@ static const uint8_t *unmarshal_one_def(
         def->constants = NULL;
         def->bytecode = NULL;
         def->sourcemap = NULL;
+        def->symbolmap = NULL;
+        def->symbolmap_length = 0;
         janet_v_push(st->lookup_defs, def);
 
         /* Set default lengths to zero */
@@ -821,6 +904,7 @@ static const uint8_t *unmarshal_one_def(
         int32_t constants_length = 0;
         int32_t environments_length = 0;
         int32_t defs_length = 0;
+        int32_t symbolmap_length = 0;
 
         /* Read flags and other fixed values */
         def->flags = readint(st, &data);
@@ -836,18 +920,20 @@ static const uint8_t *unmarshal_one_def(
             environments_length = readnat(st, &data);
         if (def->flags & JANET_FUNCDEF_FLAG_HASDEFS)
             defs_length = readnat(st, &data);
+        if (def->flags & JANET_FUNCDEF_FLAG_HASSYMBOLMAP)
+            symbolmap_length = readnat(st, &data);
 
         /* Check name and source (optional) */
         if (def->flags & JANET_FUNCDEF_FLAG_HASNAME) {
             Janet x;
             data = unmarshal_one(st, data, &x, flags + 1);
-            janet_asserttype(x, JANET_STRING);
+            janet_asserttype(x, JANET_STRING, st);
             def->name = janet_unwrap_string(x);
         }
         if (def->flags & JANET_FUNCDEF_FLAG_HASSOURCE) {
             Janet x;
             data = unmarshal_one(st, data, &x, flags + 1);
-            janet_asserttype(x, JANET_STRING);
+            janet_asserttype(x, JANET_STRING, st);
             def->source = janet_unwrap_string(x);
         }
 
@@ -863,6 +949,27 @@ static const uint8_t *unmarshal_one_def(
             def->constants = NULL;
         }
         def->constants_length = constants_length;
+
+        /* Unmarshal symbol map, if needed */
+        if (def->flags & JANET_FUNCDEF_FLAG_HASSYMBOLMAP) {
+            size_t size = sizeof(JanetSymbolMap) * symbolmap_length;
+            def->symbolmap = janet_malloc(size);
+            if (def->symbolmap == NULL) {
+                JANET_OUT_OF_MEMORY;
+            }
+            for (int32_t i = 0; i < symbolmap_length; i++) {
+                def->symbolmap[i].birth_pc = (uint32_t) readint(st, &data);
+                def->symbolmap[i].death_pc = (uint32_t) readint(st, &data);
+                def->symbolmap[i].slot_index = (uint32_t) readint(st, &data);
+                Janet value;
+                data = unmarshal_one(st, data, &value, flags + 1);
+                if (!janet_checktype(value, JANET_SYMBOL)) {
+                    janet_panicf("corrupted symbolmap when unmarshalling debug info, got %v", value);
+                }
+                def->symbolmap[i].symbol = janet_unwrap_symbol(value);
+            }
+            def->symbolmap_length = (uint32_t) symbolmap_length;
+        }
 
         /* Unmarshal bytecode */
         def->bytecode = janet_malloc(sizeof(uint32_t) * bytecode_length);
@@ -956,9 +1063,11 @@ static const uint8_t *unmarshal_one_fiber(
     fiber->env = NULL;
     fiber->last_value = janet_wrap_nil();
 #ifdef JANET_EV
-    fiber->waiting = NULL;
     fiber->sched_id = 0;
     fiber->supervisor_channel = NULL;
+    fiber->ev_state = NULL;
+    fiber->ev_callback = NULL;
+    fiber->ev_stream = NULL;
 #endif
 
     /* Push fiber to seen stack */
@@ -1007,7 +1116,7 @@ static const uint8_t *unmarshal_one_fiber(
         /* Get function */
         Janet funcv;
         data = unmarshal_one(st, data, &funcv, flags + 1);
-        janet_asserttype(funcv, JANET_FUNCTION);
+        janet_asserttype(funcv, JANET_FUNCTION, st);
         func = janet_unwrap_function(funcv);
         def = func->def;
 
@@ -1053,7 +1162,7 @@ static const uint8_t *unmarshal_one_fiber(
         Janet envv;
         fiber_flags &= ~JANET_FIBER_FLAG_HASENV;
         data = unmarshal_one(st, data, &envv, flags + 1);
-        janet_asserttype(envv, JANET_TABLE);
+        janet_asserttype(envv, JANET_TABLE, st);
         fiber_env = janet_unwrap_table(envv);
     }
 
@@ -1062,7 +1171,7 @@ static const uint8_t *unmarshal_one_fiber(
         Janet fiberv;
         fiber_flags &= ~JANET_FIBER_FLAG_HASCHILD;
         data = unmarshal_one(st, data, &fiberv, flags + 1);
-        janet_asserttype(fiberv, JANET_FIBER);
+        janet_asserttype(fiberv, JANET_FIBER, st);
         fiber->child = janet_unwrap_fiber(fiberv);
     }
 
@@ -1106,6 +1215,18 @@ int64_t janet_unmarshal_int64(JanetMarshalContext *ctx) {
     return read64(st, &(ctx->data));
 }
 
+void *janet_unmarshal_ptr(JanetMarshalContext *ctx) {
+    if (!(ctx->flags & JANET_MARSHAL_UNSAFE)) {
+        janet_panic("can only unmarshal pointers in unsafe mode");
+    }
+    UnmarshalState *st = (UnmarshalState *)(ctx->u_state);
+    void *ptr;
+    MARSH_EOS(st, ctx->data + sizeof(void *) - 1);
+    memcpy((char *) &ptr, ctx->data, sizeof(void *));
+    ctx->data += sizeof(void *);
+    return ptr;
+}
+
 uint8_t janet_unmarshal_byte(JanetMarshalContext *ctx) {
     UnmarshalState *st = (UnmarshalState *)(ctx->u_state);
     MARSH_EOS(st, ctx->data);
@@ -1141,6 +1262,18 @@ void *janet_unmarshal_abstract(JanetMarshalContext *ctx, size_t size) {
     return p;
 }
 
+void *janet_unmarshal_abstract_threaded(JanetMarshalContext *ctx, size_t size) {
+#ifdef JANET_THREADS
+    void *p = janet_abstract_threaded(ctx->at, size);
+    janet_unmarshal_abstract_reuse(ctx, p);
+    return p;
+#else
+    (void) ctx;
+    (void) size;
+    janet_panic("threaded abstracts not supported");
+#endif
+}
+
 static const uint8_t *unmarshal_one_abstract(UnmarshalState *st, const uint8_t *data, Janet *out, int flags) {
     Janet key;
     data = unmarshal_one(st, data, &key, flags + 1);
@@ -1148,7 +1281,9 @@ static const uint8_t *unmarshal_one_abstract(UnmarshalState *st, const uint8_t *
     if (at == NULL) janet_panic("unknown abstract type");
     if (at->unmarshal) {
         JanetMarshalContext context = {NULL, st, flags, data, at};
-        *out = janet_wrap_abstract(at->unmarshal(&context));
+        void *abst = at->unmarshal(&context);
+        janet_assert(abst != NULL, "null pointer abstract");
+        *out = janet_wrap_abstract(abst);
         if (context.at != NULL) {
             janet_panic("janet_unmarshal_abstract not called");
         }
@@ -1249,7 +1384,7 @@ static const uint8_t *unmarshal_one(
         }
         case LB_FIBER: {
             JanetFiber *fiber;
-            data = unmarshal_one_fiber(st, data + 1, &fiber, flags);
+            data = unmarshal_one_fiber(st, data + 1, &fiber, flags + 1);
             *out = janet_wrap_fiber(fiber);
             return data;
         }
@@ -1264,6 +1399,9 @@ static const uint8_t *unmarshal_one(
             func = janet_gcalloc(JANET_MEMORY_FUNCTION, sizeof(JanetFunction) +
                                  len * sizeof(JanetFuncEnv));
             func->def = NULL;
+            for (int32_t i = 0; i < len; i++) {
+                func->envs[i] = NULL;
+            }
             *out = janet_wrap_function(func);
             janet_v_push(st->lookup, *out);
             data = unmarshal_one_def(st, data, &def, flags + 1);
@@ -1281,6 +1419,7 @@ static const uint8_t *unmarshal_one(
         case LB_ARRAY:
         case LB_TUPLE:
         case LB_STRUCT:
+        case LB_STRUCT_PROTO:
         case LB_TABLE:
         case LB_TABLE_PROTO:
             /* Things that open with integers */
@@ -1310,9 +1449,15 @@ static const uint8_t *unmarshal_one(
                 }
                 *out = janet_wrap_tuple(janet_tuple_end(tup));
                 janet_v_push(st->lookup, *out);
-            } else if (lead == LB_STRUCT) {
+            } else if (lead == LB_STRUCT || lead == LB_STRUCT_PROTO) {
                 /* Struct */
                 JanetKV *struct_ = janet_struct_begin(len);
+                if (lead == LB_STRUCT_PROTO) {
+                    Janet proto;
+                    data = unmarshal_one(st, data, &proto, flags + 1);
+                    janet_asserttype(proto, JANET_STRUCT, st);
+                    janet_struct_proto(struct_) = janet_unwrap_struct(proto);
+                }
                 for (int32_t i = 0; i < len; i++) {
                     Janet key, value;
                     data = unmarshal_one(st, data, &key, flags + 1);
@@ -1333,7 +1478,7 @@ static const uint8_t *unmarshal_one(
                 if (lead == LB_TABLE_PROTO) {
                     Janet proto;
                     data = unmarshal_one(st, data, &proto, flags + 1);
-                    janet_asserttype(proto, JANET_TABLE);
+                    janet_asserttype(proto, JANET_TABLE, st);
                     t->proto = janet_unwrap_table(proto);
                 }
                 for (int32_t i = 0; i < len; i++) {
@@ -1363,6 +1508,29 @@ static const uint8_t *unmarshal_one(
             janet_v_push(st->lookup, *out);
             return data;
         }
+#ifdef JANET_EV
+        case LB_POINTER_BUFFER: {
+            data++;
+            int32_t count = readnat(st, &data);
+            int32_t capacity = readnat(st, &data);
+            MARSH_EOS(st, data + sizeof(void *));
+            union {
+                void *ptr;
+                uint8_t bytes[sizeof(void *)];
+            } u;
+            if (!(flags & JANET_MARSHAL_UNSAFE)) {
+                janet_panicf("unsafe flag not given, "
+                             "will not unmarshal raw pointer at index %d",
+                             (int)(data - st->start));
+            }
+            memcpy(u.bytes, data, sizeof(void *));
+            data += sizeof(void *);
+            JanetBuffer *buffer = janet_pointer_buffer_unsafe(u.ptr, capacity, count);
+            *out = janet_wrap_buffer(buffer);
+            janet_v_push(st->lookup, *out);
+            return data;
+        }
+#endif
         case LB_UNSAFE_CFUNCTION: {
             MARSH_EOS(st, data + sizeof(JanetCFunction));
             data++;
@@ -1461,16 +1629,17 @@ JANET_CORE_FN(cfun_env_lookup,
 }
 
 JANET_CORE_FN(cfun_marshal,
-              "(marshal x &opt reverse-lookup buffer)",
+              "(marshal x &opt reverse-lookup buffer no-cycles)",
               "Marshal a value into a buffer and return the buffer. The buffer "
               "can then later be unmarshalled to reconstruct the initial value. "
               "Optionally, one can pass in a reverse lookup table to not marshal "
               "aliased values that are found in the table. Then a forward "
               "lookup table can be used to recover the original value when "
               "unmarshalling.") {
-    janet_arity(argc, 1, 3);
+    janet_arity(argc, 1, 4);
     JanetBuffer *buffer;
     JanetTable *rreg = NULL;
+    uint32_t flags = 0;
     if (argc > 1) {
         rreg = janet_gettable(argv, 1);
     }
@@ -1479,7 +1648,10 @@ JANET_CORE_FN(cfun_marshal,
     } else {
         buffer = janet_buffer(10);
     }
-    janet_marshal(buffer, argv[0], rreg, 0);
+    if (argc > 3 && janet_truthy(argv[3])) {
+        flags |= JANET_MARSHAL_NO_CYCLES;
+    }
+    janet_marshal(buffer, argv[0], rreg, flags);
     return janet_wrap_buffer(buffer);
 }
 

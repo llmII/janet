@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -93,10 +93,14 @@ void janetc_freeslot(JanetCompiler *c, JanetSlot s) {
 /* Add a slot to a scope with a symbol associated with it (def or var). */
 void janetc_nameslot(JanetCompiler *c, const uint8_t *sym, JanetSlot s) {
     SymPair sp;
+    int32_t cnt = janet_v_count(c->buffer);
     sp.sym = sym;
+    sp.sym2 = sym;
     sp.slot = s;
     sp.keep = 0;
     sp.slot.flags |= JANET_SLOT_NAMED;
+    sp.birth_pc = cnt ? cnt - 1 : 0;
+    sp.death_pc = UINT32_MAX;
     janet_v_push(c->scope->syms, sp);
 }
 
@@ -159,21 +163,27 @@ void janetc_popscope(JanetCompiler *c) {
         if (oldscope->flags & JANET_SCOPE_CLOSURE) {
             newscope->flags |= JANET_SCOPE_CLOSURE;
         }
-        if (newscope->ra.max < oldscope->ra.max)
+        if (newscope->ra.max < oldscope->ra.max) {
             newscope->ra.max = oldscope->ra.max;
-
-        /* Keep upvalue slots */
-        for (int32_t i = 0; i < janet_v_count(oldscope->syms); i++) {
-            SymPair pair = oldscope->syms[i];
-            if (pair.keep) {
-                /* The variable should not be lexically accessible */
-                pair.sym = NULL;
-                janet_v_push(newscope->syms, pair);
-                janetc_regalloc_touch(&newscope->ra, pair.slot.index);
-            }
         }
 
+        /* Keep upvalue slots and symbols for debugging. */
+        for (int32_t i = 0; i < janet_v_count(oldscope->syms); i++) {
+            SymPair pair = oldscope->syms[i];
+            /* The variable should not be lexically accessible */
+            pair.sym = NULL;
+            if (pair.death_pc == UINT32_MAX) {
+                pair.death_pc = (uint32_t) janet_v_count(c->buffer);
+            }
+            if (pair.keep) {
+                /* The variable should also not be included in the locals */
+                pair.sym2 = NULL;
+                janetc_regalloc_touch(&newscope->ra, pair.slot.index);
+            }
+            janet_v_push(newscope->syms, pair);
+        }
     }
+
     /* Free the old scope */
     janet_v_free(oldscope->consts);
     janet_v_free(oldscope->syms);
@@ -195,6 +205,39 @@ void janetc_popscope_keepslot(JanetCompiler *c, JanetSlot retslot) {
     if (scope && retslot.envindex < 0 && retslot.index >= 0) {
         janetc_regalloc_touch(&scope->ra, retslot.index);
     }
+}
+
+static int lookup_missing(
+    JanetCompiler *c,
+    const uint8_t *sym,
+    JanetFunction *handler,
+    JanetBinding *out) {
+    int32_t minar = handler->def->min_arity;
+    int32_t maxar = handler->def->max_arity;
+    if (minar > 1 || maxar < 1) {
+        janetc_error(c, janet_cstring("missing symbol lookup handler must take 1 argument"));
+        return 0;
+    }
+    Janet args[1] = { janet_wrap_symbol(sym) };
+    JanetFiber *fiberp = janet_fiber(handler, 64, 1, args);
+    if (NULL == fiberp) {
+        janetc_error(c, janet_cstring("failed to call missing symbol lookup handler"));
+        return 0;
+    }
+    fiberp->env = c->env;
+    int lock = janet_gclock();
+    Janet tempOut;
+    JanetSignal status = janet_continue(fiberp, janet_wrap_nil(), &tempOut);
+    janet_gcunlock(lock);
+    if (status != JANET_SIGNAL_OK) {
+        janetc_error(c, janet_formatc("(lookup) %V", tempOut));
+        return 0;
+    }
+
+    /* Convert return value as entry. */
+    /* Alternative could use janet_resolve_ext(c->env, sym) to read result from environment. */
+    *out = janet_binding_from_entry(tempOut);
+    return 1;
 }
 
 /* Allow searching for symbols. Return information about the symbol */
@@ -230,6 +273,21 @@ JanetSlot janetc_resolve(
     /* Symbol not found - check for global */
     {
         JanetBinding binding = janet_resolve_ext(c->env, sym);
+        if (binding.type == JANET_BINDING_NONE) {
+            Janet handler = janet_table_get(c->env, janet_ckeywordv("missing-symbol"));
+            switch (janet_type(handler)) {
+                case JANET_NIL:
+                    break;
+                case JANET_FUNCTION:
+                    if (!lookup_missing(c, sym, janet_unwrap_function(handler), &binding))
+                        return janetc_cslot(janet_wrap_nil());
+                    break;
+                default:
+                    janetc_error(c, janet_formatc("invalid lookup handler %V", handler));
+                    return janetc_cslot(janet_wrap_nil());
+            }
+        }
+
         switch (binding.type) {
             default:
             case JANET_BINDING_NONE:
@@ -238,6 +296,12 @@ JanetSlot janetc_resolve(
             case JANET_BINDING_DEF:
             case JANET_BINDING_MACRO: /* Macro should function like defs when not in calling pos */
                 ret = janetc_cslot(binding.value);
+                break;
+            case JANET_BINDING_DYNAMIC_DEF:
+            case JANET_BINDING_DYNAMIC_MACRO:
+                ret = janetc_cslot(binding.value);
+                ret.flags |= JANET_SLOT_REF | JANET_SLOT_NAMED | JANET_SLOTTYPE_ANY;
+                ret.flags &= ~JANET_SLOT_CONSTANT;
                 break;
             case JANET_BINDING_VAR: {
                 ret = janetc_cslot(binding.value);
@@ -280,6 +344,7 @@ found:
     }
 
     /* non-local scope needs to expose its environment */
+    JanetScope *original_scope = scope;
     pair->keep = 1;
     while (scope && !(scope->flags & JANET_SCOPE_FUNCTION))
         scope = scope->parent;
@@ -301,7 +366,7 @@ found:
             /* Check if scope already has env. If so, break */
             len = janet_v_count(scope->envs);
             for (j = 0; j < len; j++) {
-                if (scope->envs[j] == envindex) {
+                if (scope->envs[j].envindex == envindex) {
                     scopefound = 1;
                     envindex = j;
                     break;
@@ -310,7 +375,10 @@ found:
             /* Add the environment if it is not already referenced */
             if (!scopefound) {
                 len = janet_v_count(scope->envs);
-                janet_v_push(scope->envs, envindex);
+                JanetEnvRef ref;
+                ref.envindex = envindex;
+                ref.scope = original_scope;
+                janet_v_push(scope->envs, ref);
                 envindex = len;
             }
         }
@@ -354,6 +422,7 @@ JanetSlot *janetc_toslots(JanetCompiler *c, const Janet *vals, int32_t len) {
     int32_t i;
     JanetSlot *ret = NULL;
     JanetFopts subopts = janetc_fopts_default(c);
+    subopts.flags |= JANET_FOPTS_ACCEPT_SPLICE;
     for (i = 0; i < len; i++) {
         janet_v_push(ret, janetc_value(subopts, vals[i]));
     }
@@ -364,6 +433,7 @@ JanetSlot *janetc_toslots(JanetCompiler *c, const Janet *vals, int32_t len) {
 JanetSlot *janetc_toslotskv(JanetCompiler *c, Janet ds) {
     JanetSlot *ret = NULL;
     JanetFopts subopts = janetc_fopts_default(c);
+    subopts.flags |= JANET_FOPTS_ACCEPT_SPLICE;
     const JanetKV *kvs = NULL;
     int32_t cap = 0, len = 0;
     janet_dictionary_view(ds, &kvs, &len, &cap);
@@ -651,7 +721,7 @@ static int macroexpand1(
     }
     Janet macroval;
     JanetBindingType btype = janet_resolve(c->env, name, &macroval);
-    if (btype != JANET_BINDING_MACRO ||
+    if (!(btype == JANET_BINDING_MACRO || btype == JANET_BINDING_DYNAMIC_MACRO) ||
             !janet_checktype(macroval, JANET_FUNCTION))
         return 0;
 
@@ -676,12 +746,14 @@ static int macroexpand1(
     int lock = janet_gclock();
     Janet mf_kw = janet_ckeywordv("macro-form");
     janet_table_put(c->env, mf_kw, x);
+    Janet ml_kw = janet_ckeywordv("macro-lints");
+    if (c->lints) {
+        janet_table_put(c->env, ml_kw, janet_wrap_array(c->lints));
+    }
     Janet tempOut;
     JanetSignal status = janet_continue(fiberp, janet_wrap_nil(), &tempOut);
     janet_table_put(c->env, mf_kw, janet_wrap_nil());
-    if (c->lints) {
-        janet_table_put(c->env, janet_ckeywordv("macro-lints"), janet_wrap_array(c->lints));
-    }
+    janet_table_put(c->env, ml_kw, janet_wrap_nil());
     janet_gcunlock(lock);
     if (status != JANET_SIGNAL_OK) {
         const uint8_t *es = janet_formatc("(macro) %V", tempOut);
@@ -814,7 +886,10 @@ JanetFuncDef *janetc_pop_funcdef(JanetCompiler *c) {
 
     /* Copy envs */
     def->environments_length = janet_v_count(scope->envs);
-    def->environments = janet_v_flatten(scope->envs);
+    def->environments = janet_malloc(sizeof(int32_t) * def->environments_length);
+    for (int32_t i = 0; i < def->environments_length; i++) {
+        def->environments[i] = scope->envs[i].envindex;
+    }
 
     def->constants_length = janet_v_count(scope->consts);
     def->constants = janet_v_flatten(scope->consts);
@@ -869,8 +944,65 @@ JanetFuncDef *janetc_pop_funcdef(JanetCompiler *c) {
         def->closure_bitset = chunks;
     }
 
+    /* Capture symbol to local mapping */
+    JanetSymbolMap *locals = NULL;
+
+    /* Symbol -> upvalue mapping */
+    JanetScope *top = c->scope;
+    while (top->parent) top = top->parent;
+    for (JanetScope *s = top; s != NULL; s = s->child) {
+        for (int32_t j = 0; j < janet_v_count(scope->envs); j++) {
+            JanetEnvRef ref = scope->envs[j];
+            JanetScope *upscope = ref.scope;
+            if (upscope != s) continue;
+            for (int32_t i = 0; i < janet_v_count(upscope->syms); i++) {
+                SymPair pair = upscope->syms[i];
+                if (pair.sym2) {
+                    JanetSymbolMap jsm;
+                    jsm.birth_pc = UINT32_MAX;
+                    jsm.death_pc = j;
+                    jsm.slot_index = pair.slot.index;
+                    jsm.symbol = pair.sym2;
+                    janet_v_push(locals, jsm);
+                }
+            }
+        }
+    }
+
+    /* Symbol -> slot mapping */
+    for (int32_t i = 0; i < janet_v_count(scope->syms); i++) {
+        SymPair pair = scope->syms[i];
+        if (pair.sym2) {
+            JanetSymbolMap jsm;
+            if (pair.death_pc == UINT32_MAX) {
+                jsm.death_pc = def->bytecode_length;
+            } else {
+                jsm.death_pc = pair.death_pc - scope->bytecode_start;
+            }
+            /* Handle birth_pc == 0 correctly */
+            if ((uint32_t) scope->bytecode_start > pair.birth_pc) {
+                jsm.birth_pc = 0;
+            } else {
+                jsm.birth_pc = pair.birth_pc - scope->bytecode_start;
+            }
+            janet_assert(jsm.birth_pc <= jsm.death_pc, "birth pc after death pc");
+            janet_assert(jsm.birth_pc < (uint32_t) def->bytecode_length, "bad birth pc");
+            janet_assert(jsm.death_pc <= (uint32_t) def->bytecode_length, "bad death pc");
+            jsm.slot_index = pair.slot.index;
+            jsm.symbol = pair.sym2;
+            janet_v_push(locals, jsm);
+        }
+    }
+    def->symbolmap_length = janet_v_count(locals);
+    def->symbolmap = janet_v_flatten(locals);
+    if (def->symbolmap_length) def->flags |= JANET_FUNCDEF_FLAG_HASSYMBOLMAP;
+
     /* Pop the scope */
     janetc_popscope(c);
+
+    /* Do basic optimization */
+    janet_bytecode_movopt(def);
+    janet_bytecode_remove_noops(def);
 
     return def;
 }
@@ -942,7 +1074,7 @@ JanetCompileResult janet_compile(Janet source, JanetTable *env, const uint8_t *w
 }
 
 /* C Function for compiling */
-JANET_CORE_FN(cfun,
+JANET_CORE_FN(cfun_compile,
               "(compile ast &opt env source lints)",
               "Compiles an Abstract Syntax Tree (ast) into a function. "
               "Pair the compile function with parsing functionality to implement "
@@ -951,16 +1083,25 @@ JANET_CORE_FN(cfun,
               "If a `lints` array is given, linting messages will be appended to the array. "
               "Each message will be a tuple of the form `(level line col message)`.") {
     janet_arity(argc, 1, 4);
-    JanetTable *env = argc > 1 ? janet_gettable(argv, 1) : janet_vm.fiber->env;
+    JanetTable *env = (argc > 1 && !janet_checktype(argv[1], JANET_NIL))
+                      ? janet_gettable(argv, 1) : janet_vm.fiber->env;
     if (NULL == env) {
         env = janet_table(0);
         janet_vm.fiber->env = env;
     }
     const uint8_t *source = NULL;
     if (argc >= 3) {
-        source = janet_getstring(argv, 2);
+        Janet x = argv[2];
+        if (janet_checktype(x, JANET_STRING)) {
+            source = janet_unwrap_string(x);
+        } else if (janet_checktype(x, JANET_KEYWORD)) {
+            source = janet_unwrap_keyword(x);
+        } else if (!janet_checktype(x, JANET_NIL)) {
+            janet_panic_type(x, 2, JANET_TFLAG_STRING | JANET_TFLAG_KEYWORD);
+        }
     }
-    JanetArray *lints = (argc >= 4) ? janet_getarray(argv, 3) : NULL;
+    JanetArray *lints = (argc >= 4 && !janet_checktype(argv[3], JANET_NIL))
+                        ? janet_getarray(argv, 3) : NULL;
     JanetCompileResult res = janet_compile_lint(argv[0], env, source, lints);
     if (res.status == JANET_COMPILE_OK) {
         return janet_wrap_function(janet_thunk(res.funcdef));
@@ -982,7 +1123,7 @@ JANET_CORE_FN(cfun,
 
 void janet_lib_compile(JanetTable *env) {
     JanetRegExt cfuns[] = {
-        JANET_CORE_REG("compile", cfun),
+        JANET_CORE_REG("compile", cfun_compile),
         JANET_REG_END
     };
     janet_core_cfuns_ext(env, NULL, cfuns);

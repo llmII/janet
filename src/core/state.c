@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -24,6 +24,11 @@
 #include "features.h"
 #include <janet.h>
 #include "state.h"
+#include "util.h"
+#endif
+
+#ifdef JANET_WINDOWS
+#include <windows.h>
 #endif
 
 JANET_THREAD_LOCAL JanetVM janet_vm;
@@ -57,5 +62,10 @@ void janet_vm_load(JanetVM *from) {
  * use NULL to interrupt the current VM when convenient */
 void janet_interpreter_interrupt(JanetVM *vm) {
     vm = vm ? vm : &janet_vm;
-    vm->auto_suspend = 1;
+    janet_atomic_inc(&vm->auto_suspend);
+}
+
+void janet_interpreter_interrupt_handled(JanetVM *vm) {
+    vm = vm ? vm : &janet_vm;
+    janet_atomic_dec(&vm->auto_suspend);
 }

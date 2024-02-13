@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -87,8 +87,24 @@ void janet_table_deinit(JanetTable *table) {
 }
 
 /* Create a new table */
+
 JanetTable *janet_table(int32_t capacity) {
     JanetTable *table = janet_gcalloc(JANET_MEMORY_TABLE, sizeof(JanetTable));
+    return janet_table_init_impl(table, capacity, 0);
+}
+
+JanetTable *janet_table_weakk(int32_t capacity) {
+    JanetTable *table = janet_gcalloc(JANET_MEMORY_TABLE_WEAKK, sizeof(JanetTable));
+    return janet_table_init_impl(table, capacity, 0);
+}
+
+JanetTable *janet_table_weakv(int32_t capacity) {
+    JanetTable *table = janet_gcalloc(JANET_MEMORY_TABLE_WEAKV, sizeof(JanetTable));
+    return janet_table_init_impl(table, capacity, 0);
+}
+
+JanetTable *janet_table_weakkv(int32_t capacity) {
+    JanetTable *table = janet_gcalloc(JANET_MEMORY_TABLE_WEAKKV, sizeof(JanetTable));
     return janet_table_init_impl(table, capacity, 0);
 }
 
@@ -111,12 +127,11 @@ static void janet_table_rehash(JanetTable *t, int32_t size) {
             JANET_OUT_OF_MEMORY;
         }
     }
-    int32_t i, oldcapacity;
-    oldcapacity = t->capacity;
+    int32_t oldcapacity = t->capacity;
     t->data = newdata;
     t->capacity = size;
     t->deleted = 0;
-    for (i = 0; i < oldcapacity; i++) {
+    for (int32_t i = 0; i < oldcapacity; i++) {
         JanetKV *kv = olddata + i;
         if (!janet_checktype(kv->key, JANET_NIL)) {
             JanetKV *newkv = janet_table_find(t, kv->key);
@@ -132,37 +147,21 @@ static void janet_table_rehash(JanetTable *t, int32_t size) {
 
 /* Get a value out of the table */
 Janet janet_table_get(JanetTable *t, Janet key) {
-    JanetKV *bucket = janet_table_find(t, key);
-    if (NULL != bucket && !janet_checktype(bucket->key, JANET_NIL))
-        return bucket->value;
-    /* Check prototypes */
-    {
-        int i;
-        for (i = JANET_MAX_PROTO_DEPTH, t = t->proto; t && i; t = t->proto, --i) {
-            bucket = janet_table_find(t, key);
-            if (NULL != bucket && !janet_checktype(bucket->key, JANET_NIL))
-                return bucket->value;
-        }
+    for (int i = JANET_MAX_PROTO_DEPTH; t && i; t = t->proto, --i) {
+        JanetKV *bucket = janet_table_find(t, key);
+        if (NULL != bucket && !janet_checktype(bucket->key, JANET_NIL))
+            return bucket->value;
     }
     return janet_wrap_nil();
 }
 
 /* Get a value out of the table, and record which prototype it was from. */
 Janet janet_table_get_ex(JanetTable *t, Janet key, JanetTable **which) {
-    JanetKV *bucket = janet_table_find(t, key);
-    if (NULL != bucket && !janet_checktype(bucket->key, JANET_NIL)) {
-        *which = t;
-        return bucket->value;
-    }
-    /* Check prototypes */
-    {
-        int i;
-        for (i = JANET_MAX_PROTO_DEPTH, t = t->proto; t && i; t = t->proto, --i) {
-            bucket = janet_table_find(t, key);
-            if (NULL != bucket && !janet_checktype(bucket->key, JANET_NIL)) {
-                *which = t;
-                return bucket->value;
-            }
+    for (int i = JANET_MAX_PROTO_DEPTH; t && i; t = t->proto, --i) {
+        JanetKV *bucket = janet_table_find(t, key);
+        if (NULL != bucket && !janet_checktype(bucket->key, JANET_NIL)) {
+            *which = t;
+            return bucket->value;
         }
     }
     return janet_wrap_nil();
@@ -217,6 +216,23 @@ void janet_table_put(JanetTable *t, Janet key, Janet value) {
     }
 }
 
+/* Used internally so don't check arguments
+ * Put into a table, but if the key already exists do nothing. */
+static void janet_table_put_no_overwrite(JanetTable *t, Janet key, Janet value) {
+    JanetKV *bucket = janet_table_find(t, key);
+    if (NULL != bucket && !janet_checktype(bucket->key, JANET_NIL))
+        return;
+    if (NULL == bucket || 2 * (t->count + t->deleted + 1) > t->capacity) {
+        janet_table_rehash(t, janet_tablen(2 * t->count + 2));
+    }
+    bucket = janet_table_find(t, key);
+    if (janet_checktype(bucket->value, JANET_BOOLEAN))
+        --t->deleted;
+    bucket->key = key;
+    bucket->value = value;
+    ++t->count;
+}
+
 /* Clear a table */
 void janet_table_clear(JanetTable *t) {
     int32_t capacity = t->capacity;
@@ -224,19 +240,6 @@ void janet_table_clear(JanetTable *t) {
     janet_memempty(data, capacity);
     t->count = 0;
     t->deleted = 0;
-}
-
-/* Convert table to struct */
-const JanetKV *janet_table_to_struct(JanetTable *t) {
-    JanetKV *st = janet_struct_begin(t->count);
-    JanetKV *kv = t->data;
-    JanetKV *end = t->data + t->capacity;
-    while (kv < end) {
-        if (!janet_checktype(kv->key, JANET_NIL))
-            janet_struct_put(st, kv->key, kv->value);
-        kv++;
-    }
-    return janet_struct_end(st);
 }
 
 /* Clone a table. */
@@ -275,22 +278,85 @@ void janet_table_merge_struct(JanetTable *table, const JanetKV *other) {
     janet_table_mergekv(table, other, janet_struct_capacity(other));
 }
 
+/* Convert table to struct */
+const JanetKV *janet_table_to_struct(JanetTable *t) {
+    JanetKV *st = janet_struct_begin(t->count);
+    JanetKV *kv = t->data;
+    JanetKV *end = t->data + t->capacity;
+    while (kv < end) {
+        if (!janet_checktype(kv->key, JANET_NIL))
+            janet_struct_put(st, kv->key, kv->value);
+        kv++;
+    }
+    return janet_struct_end(st);
+}
+
+JanetTable *janet_table_proto_flatten(JanetTable *t) {
+    JanetTable *newTable = janet_table(0);
+    while (t) {
+        JanetKV *kv = t->data;
+        JanetKV *end = t->data + t->capacity;
+        while (kv < end) {
+            if (!janet_checktype(kv->key, JANET_NIL))
+                janet_table_put_no_overwrite(newTable, kv->key, kv->value);
+            kv++;
+        }
+        t = t->proto;
+    }
+    return newTable;
+}
+
 /* C Functions */
 
 JANET_CORE_FN(cfun_table_new,
               "(table/new capacity)",
               "Creates a new empty table with pre-allocated memory "
-              "for capacity entries. This means that if one knows the number of "
-              "entries going to go in a table on creation, extra memory allocation "
-              "can be avoided. Returns the new table.") {
+              "for `capacity` entries. This means that if one knows the number of "
+              "entries going into a table on creation, extra memory allocation "
+              "can be avoided. "
+              "Returns the new table.") {
     janet_fixarity(argc, 1);
-    int32_t cap = janet_getinteger(argv, 0);
+    int32_t cap = janet_getnat(argv, 0);
     return janet_wrap_table(janet_table(cap));
+}
+/*
+    uint32_t flags = janet_getflags(argv, 1, "kv");
+    if (flags == 0) return janet_wrap_table(janet_table(cap));
+    if (flags == 1) return janet_wrap_table(janet_table_weakk(cap));
+    if (flags == 2) return janet_wrap_table(janet_table_weakv(cap));
+    return janet_wrap_table(janet_table_weakkv(cap));
+    */
+
+JANET_CORE_FN(cfun_table_weak,
+              "(table/weak capacity)",
+              "Creates a new empty table with weak references to keys and values. Similar to `table/new`. "
+              "Returns the new table.") {
+    janet_fixarity(argc, 1);
+    int32_t cap = janet_getnat(argv, 0);
+    return janet_wrap_table(janet_table_weakkv(cap));
+}
+
+JANET_CORE_FN(cfun_table_weak_keys,
+              "(table/weak-keys capacity)",
+              "Creates a new empty table with weak references to keys and normal references to values. Similar to `table/new`. "
+              "Returns the new table.") {
+    janet_fixarity(argc, 1);
+    int32_t cap = janet_getnat(argv, 0);
+    return janet_wrap_table(janet_table_weakk(cap));
+}
+
+JANET_CORE_FN(cfun_table_weak_values,
+              "(table/weak-values capacity)",
+              "Creates a new empty table with normal references to keys and weak references to values. Similar to `table/new`. "
+              "Returns the new table.") {
+    janet_fixarity(argc, 1);
+    int32_t cap = janet_getnat(argv, 0);
+    return janet_wrap_table(janet_table_weakv(cap));
 }
 
 JANET_CORE_FN(cfun_table_getproto,
               "(table/getproto tab)",
-              "Get the prototype table of a table. Returns nil if a table "
+              "Get the prototype table of a table. Returns nil if the table "
               "has no prototype, otherwise returns the prototype.") {
     janet_fixarity(argc, 1);
     JanetTable *t = janet_gettable(argv, 0);
@@ -301,7 +367,7 @@ JANET_CORE_FN(cfun_table_getproto,
 
 JANET_CORE_FN(cfun_table_setproto,
               "(table/setproto tab proto)",
-              "Set the prototype of a table. Returns the original table tab.") {
+              "Set the prototype of a table. Returns the original table `tab`.") {
     janet_fixarity(argc, 2);
     JanetTable *table = janet_gettable(argv, 0);
     JanetTable *proto = NULL;
@@ -323,8 +389,8 @@ JANET_CORE_FN(cfun_table_tostruct,
 
 JANET_CORE_FN(cfun_table_rawget,
               "(table/rawget tab key)",
-              "Gets a value from a table without looking at the prototype table. "
-              "If a table tab does not contain t directly, the function will return "
+              "Gets a value from a table `tab` without looking at the prototype table. "
+              "If `tab` does not contain the key directly, the function will return "
               "nil without checking the prototype. Returns the value in the table.") {
     janet_fixarity(argc, 2);
     JanetTable *table = janet_gettable(argv, 0);
@@ -349,16 +415,28 @@ JANET_CORE_FN(cfun_table_clear,
     return janet_wrap_table(table);
 }
 
+JANET_CORE_FN(cfun_table_proto_flatten,
+              "(table/proto-flatten tab)",
+              "Create a new table that is the result of merging all prototypes into a new table.") {
+    janet_fixarity(argc, 1);
+    JanetTable *table = janet_gettable(argv, 0);
+    return janet_wrap_table(janet_table_proto_flatten(table));
+}
+
 /* Load the table module */
 void janet_lib_table(JanetTable *env) {
     JanetRegExt table_cfuns[] = {
         JANET_CORE_REG("table/new", cfun_table_new),
+        JANET_CORE_REG("table/weak", cfun_table_weak),
+        JANET_CORE_REG("table/weak-keys", cfun_table_weak_keys),
+        JANET_CORE_REG("table/weak-values", cfun_table_weak_values),
         JANET_CORE_REG("table/to-struct", cfun_table_tostruct),
         JANET_CORE_REG("table/getproto", cfun_table_getproto),
         JANET_CORE_REG("table/setproto", cfun_table_setproto),
         JANET_CORE_REG("table/rawget", cfun_table_rawget),
         JANET_CORE_REG("table/clone", cfun_table_clone),
         JANET_CORE_REG("table/clear", cfun_table_clear),
+        JANET_CORE_REG("table/proto-flatten", cfun_table_proto_flatten),
         JANET_REG_END
     };
     janet_core_cfuns_ext(env, NULL, table_cfuns);

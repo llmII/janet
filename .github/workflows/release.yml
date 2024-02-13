@@ -5,9 +5,14 @@ on:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: read
+
 jobs:
 
   release:
+    permissions:
+      contents: write  # for softprops/action-gh-release to create GitHub release
     name: Build release binaries
     runs-on: ${{ matrix.os }}
     strategy:
@@ -33,3 +38,25 @@ jobs:
             build/janet.h
             build/c/janet.c
             build/c/shell.c
+
+  release-windows:
+    permissions:
+      contents: write  # for softprops/action-gh-release to create GitHub release
+    name: Build release binaries for windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@master
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Build the project
+        shell: cmd
+        run: build_win all
+      - name: Draft the release
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: true
+          files: |
+            ./dist/*.zip
+            ./*.zip
+            ./*.msi

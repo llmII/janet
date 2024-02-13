@@ -164,9 +164,14 @@ Execute a string of Janet source. Source code is executed in the order it is enc
 arguments are executed before later ones.
 
 .TP
-.BR \-E\ code arguments
+.BR \-E\ code\ arguments...
 Execute a single Janet expression as a Janet short-fn, passing the remaining command line arguments to the expression. This allows
 more concise one-liners with command line arguments.
+
+Example: janet -E '(print $0)' 12 is equivalent to '((short-fn (print $0)) 12)', which is in turn equivalent to
+`((fn [k] (print k)) 12)`
+
+See docs for the `short-fn` function for more details.
 
 .TP
 .BR \-d
@@ -177,6 +182,10 @@ default repl.
 .TP
 .BR \-n
 Disable ANSI colors in the repl. Has no effect if no repl is run.
+
+.TP
+.BR \-N
+Enable ANSI colors in the repl. Has no effect if no repl is run.
 
 .TP
 .BR \-r
@@ -261,6 +270,12 @@ To disable randomization of Janet's PRF on start up, one can set this variable. 
 effect of making programs deterministic that otherwise would depend on the random seed chosen at program start.
 This variable does nothing in the default configuration of Janet, as PRF is disabled by default. Also, JANET_REDUCED_OS
 cannot be defined for this variable to have an effect.
+.RE
+
+.B NO_COLOR
+.RS
+Turn off color by default in the repl and in the error handler of scripts. This can be changed at runtime
+via dynamic bindings *err-color* and *pretty-format*, or via the command line parameters -n and -N.
 .RE
 
 .SH AUTHOR

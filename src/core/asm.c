@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 Calvin Rose
+* Copyright (c) 2023 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -75,6 +75,7 @@ static const JanetInstructionDef janet_ops[] = {
     {"cmp", JOP_COMPARE},
     {"cncl", JOP_CANCEL},
     {"div", JOP_DIVIDE},
+    {"divf", JOP_DIVIDE_FLOOR},
     {"divim", JOP_DIVIDE_IMMEDIATE},
     {"eq", JOP_EQUALS},
     {"eqim", JOP_EQUALS_IMMEDIATE},
@@ -137,6 +138,7 @@ static const JanetInstructionDef janet_ops[] = {
     {"sru", JOP_SHIFT_RIGHT_UNSIGNED},
     {"sruim", JOP_SHIFT_RIGHT_UNSIGNED_IMMEDIATE},
     {"sub", JOP_SUBTRACT},
+    {"subim", JOP_SUBTRACT_IMMEDIATE},
     {"tcall", JOP_TAILCALL},
     {"tchck", JOP_TYPECHECK}
 };
@@ -187,7 +189,11 @@ static void janet_asm_longjmp(JanetAssembler *a) {
 
 /* Throw some kind of assembly error */
 static void janet_asm_error(JanetAssembler *a, const char *message) {
-    a->errmessage = janet_formatc("%s, instruction %d", message, a->errindex);
+    if (a->errindex < 0) {
+        a->errmessage = janet_formatc("%s", message);
+    } else {
+        a->errmessage = janet_formatc("%s, instruction %d", message, a->errindex);
+    }
     janet_asm_longjmp(a);
 }
 #define janet_asm_assert(a, c, m) do { if (!(c)) janet_asm_error((a), (m)); } while (0)
@@ -516,6 +522,7 @@ static JanetAssembleResult janet_asm1(JanetAssembler *parent, Janet source, int 
 #endif
         if (NULL != a.parent) {
             janet_asm_deinit(&a);
+            a.parent->errmessage = a.errmessage;
             janet_asm_longjmp(a.parent);
         }
         result.funcdef = NULL;
@@ -552,6 +559,10 @@ static JanetAssembleResult janet_asm1(JanetAssembler *parent, Janet source, int 
     /* Check vararg */
     x = janet_get1(s, janet_ckeywordv("vararg"));
     if (janet_truthy(x)) def->flags |= JANET_FUNCDEF_FLAG_VARARG;
+
+    /* Check structarg */
+    x = janet_get1(s, janet_ckeywordv("structarg"));
+    if (janet_truthy(x)) def->flags |= JANET_FUNCDEF_FLAG_STRUCTARG;
 
     /* Check source */
     x = janet_get1(s, janet_ckeywordv("source"));
@@ -597,6 +608,9 @@ static JanetAssembleResult janet_asm1(JanetAssembler *parent, Janet source, int 
 
     /* Parse sub funcdefs */
     x = janet_get1(s, janet_ckeywordv("closures"));
+    if (janet_checktype(x, JANET_NIL)) {
+        x = janet_get1(s, janet_ckeywordv("defs"));
+    }
     if (janet_indexed_view(x, &arr, &count)) {
         int32_t i;
         for (i = 0; i < count; i++) {
@@ -709,10 +723,63 @@ static JanetAssembleResult janet_asm1(JanetAssembler *parent, Janet source, int 
         }
     }
 
+    /* Set symbolmap */
+    def->symbolmap = NULL;
+    def->symbolmap_length = 0;
+    x = janet_get1(s, janet_ckeywordv("symbolmap"));
+    if (janet_indexed_view(x, &arr, &count)) {
+        def->symbolmap_length = count;
+        def->symbolmap = janet_malloc(sizeof(JanetSymbolMap) * (size_t)count);
+        if (NULL == def->symbolmap) {
+            JANET_OUT_OF_MEMORY;
+        }
+        for (i = 0; i < count; i++) {
+            const Janet *tup;
+            Janet entry = arr[i];
+            JanetSymbolMap ss;
+            if (!janet_checktype(entry, JANET_TUPLE)) {
+                janet_asm_error(&a, "expected tuple");
+            }
+            tup = janet_unwrap_tuple(entry);
+            if (janet_keyeq(tup[0], "upvalue")) {
+                ss.birth_pc = UINT32_MAX;
+            } else if (!janet_checkint(tup[0])) {
+                janet_asm_error(&a, "expected integer");
+            } else {
+                ss.birth_pc = janet_unwrap_integer(tup[0]);
+            }
+            if (!janet_checkint(tup[1])) {
+                janet_asm_error(&a, "expected integer");
+            }
+            if (!janet_checkint(tup[2])) {
+                janet_asm_error(&a, "expected integer");
+            }
+            if (!janet_checktype(tup[3], JANET_SYMBOL)) {
+                janet_asm_error(&a, "expected symbol");
+            }
+            ss.death_pc = janet_unwrap_integer(tup[1]);
+            ss.slot_index = janet_unwrap_integer(tup[2]);
+            ss.symbol = janet_unwrap_symbol(tup[3]);
+            def->symbolmap[i] = ss;
+        }
+    }
+    if (def->symbolmap_length) def->flags |= JANET_FUNCDEF_FLAG_HASSYMBOLMAP;
+
     /* Set environments */
-    def->environments =
-        janet_realloc(def->environments, def->environments_length * sizeof(int32_t));
-    if (NULL == def->environments) {
+    x = janet_get1(s, janet_ckeywordv("environments"));
+    if (janet_indexed_view(x, &arr, &count)) {
+        def->environments_length = count;
+        if (def->environments_length) {
+            def->environments = janet_realloc(def->environments, def->environments_length * sizeof(int32_t));
+        }
+        for (int32_t i = 0; i < count; i++) {
+            if (!janet_checkint(arr[i])) {
+                janet_asm_error(&a, "expected integer");
+            }
+            def->environments[i] = janet_unwrap_integer(arr[i]);
+        }
+    }
+    if (def->environments_length && NULL == def->environments) {
         JANET_OUT_OF_MEMORY;
     }
 
@@ -861,6 +928,29 @@ static Janet janet_disasm_slotcount(JanetFuncDef *def) {
     return janet_wrap_integer(def->slotcount);
 }
 
+static Janet janet_disasm_symbolslots(JanetFuncDef *def) {
+    if (def->symbolmap == NULL) {
+        return janet_wrap_nil();
+    }
+    JanetArray *symbolslots = janet_array(def->symbolmap_length);
+    Janet upvaluekw = janet_ckeywordv("upvalue");
+    for (int32_t i = 0; i < def->symbolmap_length; i++) {
+        JanetSymbolMap ss = def->symbolmap[i];
+        Janet *t = janet_tuple_begin(4);
+        if (ss.birth_pc == UINT32_MAX) {
+            t[0] = upvaluekw;
+        } else {
+            t[0] = janet_wrap_integer(ss.birth_pc);
+        }
+        t[1] = janet_wrap_integer(ss.death_pc);
+        t[2] = janet_wrap_integer(ss.slot_index);
+        t[3] = janet_wrap_symbol(ss.symbol);
+        symbolslots->data[i] = janet_wrap_tuple(janet_tuple_end(t));
+    }
+    symbolslots->count = def->symbolmap_length;
+    return janet_wrap_array(symbolslots);
+}
+
 static Janet janet_disasm_bytecode(JanetFuncDef *def) {
     JanetArray *bcode = janet_array(def->bytecode_length);
     for (int32_t i = 0; i < def->bytecode_length; i++) {
@@ -882,6 +972,10 @@ static Janet janet_disasm_name(JanetFuncDef *def) {
 
 static Janet janet_disasm_vararg(JanetFuncDef *def) {
     return janet_wrap_boolean(def->flags & JANET_FUNCDEF_FLAG_VARARG);
+}
+
+static Janet janet_disasm_structarg(JanetFuncDef *def) {
+    return janet_wrap_boolean(def->flags & JANET_FUNCDEF_FLAG_STRUCTARG);
 }
 
 static Janet janet_disasm_constants(JanetFuncDef *def) {
@@ -933,8 +1027,10 @@ Janet janet_disasm(JanetFuncDef *def) {
     janet_table_put(ret, janet_ckeywordv("bytecode"), janet_disasm_bytecode(def));
     janet_table_put(ret, janet_ckeywordv("source"), janet_disasm_source(def));
     janet_table_put(ret, janet_ckeywordv("vararg"), janet_disasm_vararg(def));
+    janet_table_put(ret, janet_ckeywordv("structarg"), janet_disasm_structarg(def));
     janet_table_put(ret, janet_ckeywordv("name"), janet_disasm_name(def));
     janet_table_put(ret, janet_ckeywordv("slotcount"), janet_disasm_slotcount(def));
+    janet_table_put(ret, janet_ckeywordv("symbolmap"), janet_disasm_symbolslots(def));
     janet_table_put(ret, janet_ckeywordv("constants"), janet_disasm_constants(def));
     janet_table_put(ret, janet_ckeywordv("sourcemap"), janet_disasm_sourcemap(def));
     janet_table_put(ret, janet_ckeywordv("environments"), janet_disasm_environments(def));
@@ -952,7 +1048,7 @@ JANET_CORE_FN(cfun_asm,
     JanetAssembleResult res;
     res = janet_asm(argv[0], 0);
     if (res.status != JANET_ASSEMBLE_OK) {
-        janet_panics(res.error);
+        janet_panics(res.error ? res.error : janet_cstring("invalid assembly"));
     }
     return janet_wrap_function(janet_thunk(res.funcdef));
 }
@@ -971,6 +1067,7 @@ JANET_CORE_FN(cfun_disasm,
               "* :source - name of source file that this function was compiled from.\n"
               "* :name - name of function.\n"
               "* :slotcount - how many virtual registers, or slots, this function uses. Corresponds to stack space used by function.\n"
+              "* :symbolmap - all symbols and their slots.\n"
               "* :constants - an array of constants referenced by this function.\n"
               "* :sourcemap - a mapping of each bytecode instruction to a line and column in the source file.\n"
               "* :environments - an internal mapping of which enclosing functions are referenced for bindings.\n"
@@ -986,6 +1083,7 @@ JANET_CORE_FN(cfun_disasm,
         if (!janet_cstrcmp(kw, "source")) return janet_disasm_source(f->def);
         if (!janet_cstrcmp(kw, "name")) return janet_disasm_name(f->def);
         if (!janet_cstrcmp(kw, "vararg")) return janet_disasm_vararg(f->def);
+        if (!janet_cstrcmp(kw, "structarg")) return janet_disasm_structarg(f->def);
         if (!janet_cstrcmp(kw, "slotcount")) return janet_disasm_slotcount(f->def);
         if (!janet_cstrcmp(kw, "constants")) return janet_disasm_constants(f->def);
         if (!janet_cstrcmp(kw, "sourcemap")) return janet_disasm_sourcemap(f->def);
