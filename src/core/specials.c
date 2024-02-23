@@ -304,6 +304,49 @@ static JanetSlot janetc_varset(JanetFopts opts, int32_t argn, const Janet *argv)
     }
 }
 
+#define JANET_UNBUNDLED_DOCS
+int writedocfile(const char *binding_name, const unsigned char *attr) {
+    size_t el = 0;
+    char *encoded = NULL, *fn = NULL;
+    FILE *fd;
+    /* Process:
+     *
+     * Encode a file name.
+     * Open file for writing, truncating as necessary.
+     * Write docstring to file.
+     * Close file.
+     */
+    encoded = b64_encode(binding_name, strlen(binding_name), &el);
+    /* decoded = b64_decode(encoded, el, &el);
+    printf("binding_name='%s' encoded='%s'"
+           " decoded='%s' lossage=%zu\n",
+           binding_name, encoded, decoded, el);
+    free(decoded); */
+
+    /* Make file name */
+    fn = (char *)(malloc(el + 10 + 1));
+    memcpy(fn, "/tmp/docs/", 10);
+    memcpy(fn + 10, encoded, el + 1);
+    /*printf("'%s' : '%s'='%s'\n", binding_name, fn, encoded);*/
+
+    fd = fopen(fn, "w");
+    if(fd == NULL) goto error;
+
+    if(EOF == fputs((const char *)attr, fd)) goto error;
+    if(EOF == fflush(fd)) goto error;
+
+    free(encoded);
+    free(fn);
+    fclose(fd);
+    el = 0;
+
+    return 0; /* TODO: do something useful here. */
+
+error:
+    /* check things, close or free them */
+    return 1;
+}
+
 /* Add attributes to a global def or var table */
 static JanetTable *handleattr(JanetCompiler *c, const char *kind, int32_t argn, const Janet *argv) {
     int32_t i;
@@ -311,28 +354,36 @@ static JanetTable *handleattr(JanetCompiler *c, const char *kind, int32_t argn, 
     const char *binding_name = janet_type(argv[0]) == JANET_SYMBOL
                                ? ((const char *)janet_unwrap_symbol(argv[0]))
                                : "<multiple bindings>";
+
     if (argn < 2) {
-        janetc_error(c, janet_formatc("expected at least 2 arguments to %s", kind));
+        janetc_error(
+            c, janet_formatc("expected at least 2 arguments to %s", kind));
         return NULL;
     }
     for (i = 1; i < argn - 1; i++) {
         Janet attr = argv[i];
         switch (janet_type(attr)) {
-            case JANET_TUPLE:
-                janetc_cerror(c, "unexpected form - did you intend to use defn?");
-                break;
-            default:
-                janetc_error(c, janet_formatc("cannot add metadata %v to binding %s", attr, binding_name));
-                break;
-            case JANET_KEYWORD:
-                janet_table_put(tab, attr, janet_wrap_true());
-                break;
-            case JANET_STRING:
-                janet_table_put(tab, janet_ckeywordv("doc"), attr);
-                break;
-            case JANET_STRUCT:
-                janet_table_merge_struct(tab, janet_unwrap_struct(attr));
-                break;
+        case JANET_TUPLE:
+            janetc_cerror(c, "unexpected form - did you intend to use defn?");
+            break;
+        default:
+            janetc_error(c,
+                         janet_formatc("cannot add metadata %v to binding %s",
+                                       attr, binding_name));
+            break;
+        case JANET_KEYWORD:
+            janet_table_put(tab, attr, janet_wrap_true());
+            break;
+        case JANET_STRING:
+            #ifdef JANET_UNBUNDLED_DOCS
+            writedocfile(binding_name, janet_unwrap_string(attr));
+            #else
+            janet_table_put(tab, janet_ckeywordv("doc"), attr);
+            #endif
+            break;
+        case JANET_STRUCT:
+            janet_table_merge_struct(tab, janet_unwrap_struct(attr));
+            break;
         }
     }
     return tab;

@@ -69,6 +69,8 @@ uint32_t janet_hash_mix(uint32_t input, uint32_t more);
 int janet_valid_utf8(const uint8_t *str, int32_t len);
 int janet_is_symbol_char(uint8_t c);
 extern const char janet_base64[65];
+char *b64_encode(const char *data, size_t len, size_t *encoded_len);
+char *b64_decode(const char *data, size_t len, size_t *lossage);
 int32_t janet_array_calchash(const Janet *array, int32_t len);
 int32_t janet_kv_calchash(const JanetKV *kvs, int32_t len);
 int32_t janet_string_calchash(const uint8_t *str, int32_t len);

@@ -1097,3 +1097,215 @@ void *(janet_calloc)(size_t nmemb, size_t size) {
 void *(janet_realloc)(void *ptr, size_t size) {
     return janet_realloc(ptr, size);
 }
+
+/* TODO: I hate `=` in filenames.
+ *
+ *  To fix absinthism, encode needs to strip such, and decode
+ *  needs to pretend they are still there.
+ *
+ * NOTE: Our base64 encoder is specialized to support file names. */
+
+/* b64_encode is the result of looking around on the documentation of how this
+ * works and following a couple of site tutorials. It most likely should be
+ * better implemented. */
+char *b64_encode(const char *data, size_t len, size_t *encoded_len) {
+    static const char b64em[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *out = NULL;
+    *encoded_len = 0;
+    size_t v;
+
+    /* We got nothing, return a bunch of nothing. */
+    if(data == NULL || len == 0) return NULL;
+
+    /* Calculate the encoded length */
+    *encoded_len = len;
+    if (len % 3 != 0)
+        *encoded_len += 3 - (len % 3);
+    *encoded_len /= 3;
+    *encoded_len *= 4;
+
+    /* allocate memory */
+    out = (char *)malloc(*encoded_len + 1);
+    out[*encoded_len] = '\0';
+
+    /* encode it */
+    for (size_t i = 0, j = 0; i < len; i += 3, j += 4) {
+        v = data[i];
+        v = i + 1 < len ? v << 8 | data[i + 1] : v << 8;
+        v = i + 2 < len ? v << 8 | data[i + 2] : v << 8;
+
+        out[j] = b64em[(v >> 18) & 0x3F];
+        out[j + 1] = b64em[(v >> 12) & 0x3F];
+        if (i + 1 < len) {
+            out[j + 2] = b64em[(v >> 6) & 0x3F];
+        } else {
+            out[j + 2] = '=';
+        }
+        if (i + 2 < len) {
+            out[j + 3] = b64em[v & 0x3F];
+        } else {
+            out[j + 3] = '=';
+        }
+
+        /* replace incompatible characters */
+        /* NOTE: I don't like '=' for filenames, but it'll do. */
+        switch(out[j]) {
+            case '+':
+                out[j] = '-';
+                break;
+                ;
+            case '/':
+                out[j] = '_';
+            default:
+                break;
+        }
+
+        switch(out[j + 3]) {
+            case '+':
+                out[j] = '-';
+                break;
+                ;
+            case '/':
+                out[j] = '_';
+            default:
+                break;
+        }
+    }
+
+    return out;
+}
+
+char b64_map_special(const char *c) {
+    switch(*c) {
+        case '-':
+            return '+';
+        case '_':
+            return '/';
+        default:
+            return *c;
+    }
+}
+
+size_t b64_decode_size(const char *in, size_t len)
+{
+	size_t ret;
+
+	if (in == NULL)
+		return 0;
+
+	ret = len / 4 * 3;
+
+	for (size_t i = len; i-- > 0; ) {
+		if (in[i] == '=') {
+			ret--;
+		} else {
+			break;
+		}
+	}
+
+	return ret;
+}
+
+/* Heavily based on:
+ * https://github.com/pticon/base64/blob/master/base64.c
+ *
+ * Credit to pticon@github
+ * At the time of utilization, was MIT licensed. */
+char *b64_decode(const char *data, size_t len, size_t *lossage) {
+    static const uint8_t b64demap[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0x3E, 0xFF, 0xFF, 0xFF, 0x3F,
+        0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B,
+        0x3C, 0x3D, 0xFF, 0xFF, 0xFF, 0xFE, 0xFF, 0xFF,
+        0xFF, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+        0x17, 0x18, 0x19, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30,
+        0x31, 0x32, 0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    size_t buf_size = b64_decode_size(data, len);
+    char *out;
+    char *buf;
+    *lossage = len;
+
+    if (len == 0 || ((len & 3) > 0)) {
+        /* Invalid base64 input */
+        return NULL;
+    }
+
+    buf = (char *)malloc(buf_size + 1);
+    out = buf;
+
+    uint8_t byte[4];
+    while (*lossage > 4) {
+        byte[0] = b64demap[(int)b64_map_special(data + 0)];
+        byte[1] = b64demap[(int)b64_map_special(data + 1)];
+        byte[2] = b64demap[(int)b64_map_special(data + 2)];
+        byte[3] = b64demap[(int)b64_map_special(data + 3)];
+        if ((byte[0] > 0xFD) || (byte[1] > 0xFD) || (byte[2] > 0xFD) || (byte[3] > 0xFD)) {
+            /* Invalid byte */
+            return 0;
+        }
+        out[0] = (byte[0] << 2) + (byte[1] >> 4);
+        out[1] = (byte[1] << 4) + (byte[2] >> 2);
+        out[2] = (byte[2] << 6) + (byte[3] >> 0);
+        data += 4;
+        out += 3;
+        *lossage -= 4;
+    }
+
+    /* last four */
+    byte[0] = b64demap[(int)b64_map_special(data + 0)];
+    byte[1] = b64demap[(int)b64_map_special(data + 1)];
+    byte[2] = b64demap[(int)b64_map_special(data + 2)];
+    byte[3] = b64demap[(int)b64_map_special(data + 3)];
+
+    if ((byte[0] > 0xFD) || (byte[1] > 0xFD) || (byte[2] == 0xFF)) {
+        return 0;
+    }
+
+    *out++ = (byte[0] << 2) + (byte[1] >> 4);
+    if (byte[2] == 0xFE && byte[3] == 0xFE) {
+        /* xx== */
+    } else if (byte[2] < 0xFD && byte[3] == 0xFE) {
+        /* xxx= */
+        *out++ = (byte[1] << 4) + (byte[2] >> 2);
+    } else if (byte[2] < 0xFD && byte[3] < 0xFD) {
+        /* xxxx */
+        *out++ = (byte[1] << 4) + (byte[2] >> 2);
+        *out++ = (byte[2] << 6) + (byte[3] >> 0);
+    } else {
+        /* Invalid byte */
+        *buf = '\0';
+        return buf;
+    }
+    *lossage -= 4;
+
+    *out = '\0';
+
+    return buf;
+}
