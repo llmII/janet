@@ -1105,29 +1105,41 @@ void *(janet_realloc)(void *ptr, size_t size) {
  *
  * NOTE: Our base64 encoder is specialized to support file names. */
 
+
+char b64_unmap_special(const char *c) {
+    switch(*c) {
+        case '+':
+            return '-';
+        case '/':
+            return '_';
+        default:
+            return *c;
+    }
+}
+
 /* b64_encode is the result of looking around on the documentation of how this
  * works and following a couple of site tutorials. It most likely should be
  * better implemented. */
-char *b64_encode(const char *data, size_t len, size_t *encoded_len) {
+size_t b64_encode(const char *data, char *dest, size_t len) {
     static const char b64em[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "abcdefghijklmnopqrstuvwxyz0123456789+/";
-    char *out = NULL;
-    *encoded_len = 0;
-    size_t v;
+    size_t el = 0, v = 0;
 
-    /* We got nothing, return a bunch of nothing. */
-    if(data == NULL || len == 0) return NULL;
+    /* Encoding a 0 length string isn't possible */
+    if (len == 0) return 0;
 
-    /* Calculate the encoded length */
-    *encoded_len = len;
-    if (len % 3 != 0)
-        *encoded_len += 3 - (len % 3);
-    *encoded_len /= 3;
-    *encoded_len *= 4;
+    el = len;
+    if (len %3 != 0)
+        el += 3 - (len % 3);
+    el /= 3;
+    el *= 4;
 
-    /* allocate memory */
-    out = (char *)malloc(*encoded_len + 1);
-    out[*encoded_len] = '\0';
+    /* Early return to get size of necessary buffer */
+    if (dest == NULL)
+        return el;
+
+    /* Ensure null termination */
+    *(dest + len) = '\0';
 
     /* encode it */
     for (size_t i = 0, j = 0; i < len; i += 3, j += 4) {
@@ -1135,45 +1147,27 @@ char *b64_encode(const char *data, size_t len, size_t *encoded_len) {
         v = i + 1 < len ? v << 8 | data[i + 1] : v << 8;
         v = i + 2 < len ? v << 8 | data[i + 2] : v << 8;
 
-        out[j] = b64em[(v >> 18) & 0x3F];
-        out[j + 1] = b64em[(v >> 12) & 0x3F];
+        dest[j] = b64em[(v >> 18) & 0x3F];
+        dest[j + 1] = b64em[(v >> 12) & 0x3F];
         if (i + 1 < len) {
-            out[j + 2] = b64em[(v >> 6) & 0x3F];
+            dest[j + 2] = b64em[(v >> 6) & 0x3F];
         } else {
-            out[j + 2] = '=';
+            dest[j + 2] = '=';
         }
         if (i + 2 < len) {
-            out[j + 3] = b64em[v & 0x3F];
+            dest[j + 3] = b64em[v & 0x3F];
         } else {
-            out[j + 3] = '=';
+            dest[j + 3] = '=';
         }
 
-        /* replace incompatible characters */
-        /* NOTE: I don't like '=' for filenames, but it'll do. */
-        switch(out[j]) {
-            case '+':
-                out[j] = '-';
-                break;
-                ;
-            case '/':
-                out[j] = '_';
-            default:
-                break;
-        }
-
-        switch(out[j + 3]) {
-            case '+':
-                out[j] = '-';
-                break;
-                ;
-            case '/':
-                out[j] = '_';
-            default:
-                break;
-        }
+        *(dest + j) = b64_unmap_special(dest + j);
+        *(dest + j + 1) = b64_unmap_special(dest + j + 1);
+        *(dest + j + 2) = b64_unmap_special(dest + j + 2);
+        *(dest + j + 3) = b64_unmap_special(dest + j + 3);
+        *(dest + j + 5) = '\0';
     }
 
-    return out;
+    return 0;
 }
 
 char b64_map_special(const char *c) {

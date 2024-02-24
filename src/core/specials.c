@@ -305,50 +305,95 @@ static JanetSlot janetc_varset(JanetFopts opts, int32_t argn, const Janet *argv)
 }
 
 #define JANET_UNBUNDLED_DOCS
-int writedocfile(const char *binding_name, const unsigned char *attr) {
-    size_t el = 0;
-    char *encoded = NULL, *fn = NULL;
-    FILE *fd;
-    /* Process:
-     *
-     * Encode a file name.
-     * Open file for writing, truncating as necessary.
-     * Write docstring to file.
-     * Close file.
-     */
-    encoded = b64_encode(binding_name, strlen(binding_name), &el);
-    /* decoded = b64_decode(encoded, el, &el);
-    printf("binding_name='%s' encoded='%s'"
-           " decoded='%s' lossage=%zu\n",
-           binding_name, encoded, decoded, el);
-    free(decoded); */
+int writedocfile(const char *symbol, const char *source_file, const char *doc,
+                  char *directory, int32_t line, int32_t column) {
+    size_t pel = 0, sl = 0, cl = 0, sfl = 0, ll = 0, el = 0, dl = 0;
+    char *doc_fn = NULL, *pe = NULL, *tmp = NULL;
+    FILE *fd = NULL;
 
-    /* Make file name */
-    fn = (char *)(malloc(el + 10 + 1));
-    memcpy(fn, "/tmp/docs/", 10);
-    memcpy(fn + 10, encoded, el + 1);
-    /*printf("'%s' : '%s'='%s'\n", binding_name, fn, encoded);*/
+    /* Determine lengths. */
+    sl += strlen(symbol);
+    cl += snprintf(NULL, 0, "%d", column);
+    sfl += strlen(source_file);
+    ll += snprintf(NULL, 0, "%d", line);
 
-    fd = fopen(fn, "w");
-    if(fd == NULL) goto error;
+    /* Get a buffer large enough for the combination of the above. */
+    pel = sl + el + sfl + ll + 4; /* 3 for separators */
+    pe = malloc(pel);
+    if (pe == NULL)
+        goto error;
 
-    if(EOF == fputs((const char *)attr, fd)) goto error;
+    /* Fill the filename pre-encode buffer. */
+    /* line'column'symbol'source */
+    tmp = pe;
+
+    snprintf(tmp, cl + 1, "%d", line);
+    tmp += cl;
+    *tmp = '\'';
+    tmp++;
+
+    snprintf(tmp, cl + 1, "%d", column);
+    tmp += cl;
+    *tmp = '\'';
+    tmp++;
+
+    memcpy(tmp, symbol, sl);
+    tmp += sl;
+    *tmp = '\'';
+    tmp++;
+
+    memcpy(tmp, source_file, sfl);
+    *(tmp + sfl) = '\0';
+
+    /* Allocate document filename */
+    el = b64_encode(pe, NULL, pel);
+    dl = strlen(directory);
+    doc_fn = malloc(el + dl + 1);
+    if (doc_fn == NULL)
+        goto error;
+
+    /* Push path into doc_fn */
+    memcpy(doc_fn, directory, dl);
+
+    /* Append the filename */
+    printf("/*pe=%s\n*/", pe);
+    b64_encode(pe, doc_fn + dl, pel - 1);
+    free(pe);
+
+    /* Commence file operations */
+    printf("/* symbol='%s' source='%s' directory='%s' line='%d'"
+           " column='%d'  encodes_to='%s' */\n",
+           symbol,
+           source_file,
+           directory,
+           line,
+           column,
+           doc_fn);
+    fflush(stdout);
+
+    fd = fopen(doc_fn, "w");
+    if (fd == NULL) goto error;
+    free(doc_fn);
+    if(EOF == fputs(doc, fd)) goto error;
     if(EOF == fflush(fd)) goto error;
-
-    free(encoded);
-    free(fn);
     fclose(fd);
-    el = 0;
 
-    return 0; /* TODO: do something useful here. */
+    return 1; /* 1 = success, simplify if statements */
 
 error:
-    /* check things, close or free them */
-    return 1;
+    if (doc_fn != NULL) free(doc_fn);
+    if (pe != NULL) free(pe);
+    if (fd != NULL) fclose(fd);
+
+    return 0;
 }
 
 /* Add attributes to a global def or var table */
-static JanetTable *handleattr(JanetCompiler *c, const char *kind, int32_t argn, const Janet *argv) {
+static JanetTable *handleattr(JanetCompiler *c,
+                              const char *kind, int32_t argn,
+                              const Janet *argv,
+                              const JanetSourceMapping sm,
+                              const uint8_t *source) {
     int32_t i;
     JanetTable *tab = janet_table(2);
     const char *binding_name = janet_type(argv[0]) == JANET_SYMBOL
@@ -376,7 +421,10 @@ static JanetTable *handleattr(JanetCompiler *c, const char *kind, int32_t argn, 
             break;
         case JANET_STRING:
             #ifdef JANET_UNBUNDLED_DOCS
-            writedocfile(binding_name, janet_unwrap_string(attr));
+            /* NOTE: does this mean attr gets GC'd later? */
+            /* TODO: move this out to janetc_var and janetc_def */
+            writedocfile(binding_name, source, janet_unwrap_string(attr),
+                         "/tmp/docs/", sm.line, sm.column);
             #else
             janet_table_put(tab, janet_ckeywordv("doc"), attr);
             #endif
@@ -500,7 +548,8 @@ static int varleaf(
 
 static JanetSlot janetc_var(JanetFopts opts, int32_t argn, const Janet *argv) {
     JanetCompiler *c = opts.compiler;
-    JanetTable *attr_table = handleattr(c, "var", argn, argv);
+    JanetTable *attr_table = handleattr(c, "var", argn, argv,
+                                        c->current_mapping, c->source);
     if (c->result.status == JANET_COMPILE_ERROR) {
         return janetc_cslot(janet_wrap_nil());
     }
@@ -560,7 +609,8 @@ static int defleaf(
 
 static JanetSlot janetc_def(JanetFopts opts, int32_t argn, const Janet *argv) {
     JanetCompiler *c = opts.compiler;
-    JanetTable *attr_table = handleattr(c, "def", argn, argv);
+    JanetTable *attr_table = handleattr(c, "def", argn, argv,
+                                        c->current_mapping, c->source);
     if (c->result.status == JANET_COMPILE_ERROR) {
         return janetc_cslot(janet_wrap_nil());
     }
