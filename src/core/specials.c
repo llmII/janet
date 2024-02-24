@@ -318,7 +318,7 @@ int writedocfile(const char *symbol, const char *source_file, const char *doc,
     ll += snprintf(NULL, 0, "%d", line);
 
     /* Get a buffer large enough for the combination of the above. */
-    pel = sl + el + sfl + ll + 4; /* 3 for separators */
+    pel = sl + el + sfl + ll + 3; /* 3 for separators */
     pe = malloc(pel);
     if (pe == NULL)
         goto error;
@@ -356,27 +356,36 @@ int writedocfile(const char *symbol, const char *source_file, const char *doc,
     memcpy(doc_fn, directory, dl);
 
     /* Append the filename */
-    printf("/*pe=%s\n*/", pe);
-    b64_encode(pe, doc_fn + dl, pel - 1);
+    printf("/*pe=%s\n", pe); /* DEBUG print */
+    b64_encode(pe, doc_fn + dl, pel);
     free(pe);
+    pe = NULL;
 
     /* Commence file operations */
-    printf("/* symbol='%s' source='%s' directory='%s' line='%d'"
-           " column='%d'  encodes_to='%s' */\n",
+    char *decoded = b64_decode(doc_fn + dl, el, &el); /* DEBUG print */
+    printf("\tsymbol='%s' source='%s' directory='%s' line='%d'"
+           " column='%d'\n\tencodes_to='%s'\n\tdecodes_from='%s'"
+           "\n\tdecodes_to='%s'"
+           " with lossage='%zu' */\n",
            symbol,
            source_file,
            directory,
            line,
            column,
-           doc_fn);
-    fflush(stdout);
+           doc_fn,
+           doc_fn + dl,
+           decoded,
+           el);
+    fflush(stdout); /* DEBUG print */
 
     fd = fopen(doc_fn, "w");
     if (fd == NULL) goto error;
     free(doc_fn);
+    doc_fn = NULL;
     if(EOF == fputs(doc, fd)) goto error;
     if(EOF == fflush(fd)) goto error;
     fclose(fd);
+    fd = NULL;
 
     return 1; /* 1 = success, simplify if statements */
 
