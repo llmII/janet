@@ -322,7 +322,7 @@ int writedocfile(const char *symbol,
     ll += snprintf(NULL, 0, "%d", line);
 
     /* Get a buffer large enough for the combination of the above. */
-    pel = sl + el + sfl + ll + 4; /* 1 for \0 and  3 for separators */
+    pel = sl + cl + sfl + ll + 4; /* 1 for \0 and  3 for separators */
     pe = malloc(pel);
     if (pe == NULL)
         goto error;
@@ -360,16 +360,19 @@ int writedocfile(const char *symbol,
     memcpy(doc_fn, directory, dl);
 
     /* Append the filename */
-    printf("/*pe=%s\n", pe); /* DEBUG print */
+    printf("/* pe=%s\n", pe); /* DEBUG print */
     b64_encode(pe, doc_fn + dl, pel);
     free(pe);
     pe = NULL;
 
     /* Commence file operations */
     char *decoded = b64_decode(doc_fn + dl, el, &el); /* DEBUG print */
-    printf("\tsymbol='%s' source='%s' directory='%s' line='%d'"
-           " column='%d'\n\tencodes_to='%s'\n\tdecodes_from='%s'"
-           "\n\tdecodes_to='%s' with lossage='%zu' */\n",
+    printf("   symbol=%s source=%s directory=%s\n"
+           "   line=%d column=%d\n"
+           "   encodes_to=%s\n"
+           "   decodes_from=%s\n"
+           "   decodes_to=%s\n"
+           "   with lossage=%zu */\n",
            symbol,
            source_file,
            directory,
@@ -434,9 +437,10 @@ static JanetTable *handleattr(JanetCompiler *c,
         case JANET_STRING:
             #ifdef JANET_UNBUNDLED_DOCS
             /* NOTE: does this mean attr gets GC'd later? */
-            /* TODO: move this out to janetc_var and janetc_def */
-            writedocfile(binding_name, source, janet_unwrap_string(attr),
-                         "/tmp/docs/", sm.line, sm.column);
+            if(!writedocfile(binding_name, source, janet_unwrap_string(attr),
+                             "/tmp/docs/", sm.line, sm.column)) {
+                janet_panic("Error writing doc files.");
+            }
             #else
             janet_table_put(tab, janet_ckeywordv("doc"), attr);
             #endif
