@@ -1107,7 +1107,7 @@ void *(janet_realloc)(void *ptr, size_t size) {
 
 
 char b64_unmap_special(const char *c) {
-    switch(*c) {
+    switch (*c) {
         case '+':
             return '-';
         case '/':
@@ -1122,14 +1122,14 @@ char b64_unmap_special(const char *c) {
  * better implemented. */
 size_t b64_encode(const char *data, char *dest, size_t len) {
     static const char b64em[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz0123456789+/";
+                                "abcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t el = 0, v = 0;
 
     /* Encoding a 0 length string isn't possible */
     if (len == 0) return 0;
 
     el = len;
-    if (len %3 != 0)
+    if (len % 3 != 0)
         el += 3 - (len % 3);
     el /= 3;
     el *= 4;
@@ -1137,9 +1137,6 @@ size_t b64_encode(const char *data, char *dest, size_t len) {
     /* Early return to get size of necessary buffer */
     if (dest == NULL)
         return el;
-
-    /* Ensure null termination */
-    *(dest + len) = '\0';
 
     /* encode it */
     for (size_t i = 0, j = 0; i < len; i += 3, j += 4) {
@@ -1164,14 +1161,16 @@ size_t b64_encode(const char *data, char *dest, size_t len) {
         *(dest + j + 1) = b64_unmap_special(dest + j + 1);
         *(dest + j + 2) = b64_unmap_special(dest + j + 2);
         *(dest + j + 3) = b64_unmap_special(dest + j + 3);
-        *(dest + j + 5) = '\0';
     }
+
+    /* Ensure null termination */
+    *(dest + el) = '\0';
 
     return 0;
 }
 
 char b64_map_special(const char *c) {
-    switch(*c) {
+    switch (*c) {
         case '-':
             return '+';
         case '_':
@@ -1181,24 +1180,23 @@ char b64_map_special(const char *c) {
     }
 }
 
-size_t b64_decode_size(const char *in, size_t len)
-{
-	size_t ret;
+size_t b64_decode_size(const char *in, size_t len) {
+    size_t ret;
 
-	if (in == NULL)
-		return 0;
+    if (in == NULL)
+        return 0;
 
-	ret = len / 4 * 3;
+    ret = len / 4 * 3;
 
-	for (size_t i = len; i-- > 0; ) {
-		if (in[i] == '=') {
-			ret--;
-		} else {
-			break;
-		}
-	}
+    for (size_t i = len; i-- > 0;) {
+        if (in[i] == '=') {
+            ret--;
+        } else {
+            break;
+        }
+    }
 
-	return ret;
+    return ret;
 }
 
 /* Heavily based on:

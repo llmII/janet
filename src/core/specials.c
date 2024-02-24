@@ -316,10 +316,10 @@ int writedocfile(const char *symbol,
     FILE *fd = NULL;
 
     /* Determine lengths. */
-    sl += strlen(symbol);
-    cl += snprintf(NULL, 0, "%d", column);
-    sfl += strlen((const char *)source_file);
-    ll += snprintf(NULL, 0, "%d", line);
+    sl = strlen(symbol);
+    cl = snprintf(NULL, 0, "%d", column);
+    sfl = strlen((const char *)source_file);
+    ll = snprintf(NULL, 0, "%d", line);
 
     /* Get a buffer large enough for the combination of the above. */
     pel = sl + cl + sfl + ll + 4; /* 1 for \0 and  3 for separators */
@@ -368,6 +368,7 @@ int writedocfile(const char *symbol,
     /* Commence file operations */
     char *decoded = b64_decode(doc_fn + dl, el, &el); /* DEBUG print */
     printf("   symbol=%s source=%s directory=%s\n"
+           "   pel=%zu sl=%zu cl=%zu sfl=%zu ll=%zu dl=%zu"
            "   line=%d column=%d\n"
            "   encodes_to=%s\n"
            "   decodes_from=%s\n"
@@ -376,6 +377,7 @@ int writedocfile(const char *symbol,
            symbol,
            source_file,
            directory,
+           pel, sl, cl, sfl, ll, dl,
            line,
            column,
            doc_fn,
@@ -388,8 +390,8 @@ int writedocfile(const char *symbol,
     if (fd == NULL) goto error;
     free(doc_fn);
     doc_fn = NULL;
-    if(EOF == fputs((char*)doc, fd)) goto error;
-    if(EOF == fflush(fd)) goto error;
+    if (EOF == fputs((char *)doc, fd)) goto error;
+    if (EOF == fflush(fd)) goto error;
     fclose(fd);
     fd = NULL;
 
@@ -423,31 +425,30 @@ static JanetTable *handleattr(JanetCompiler *c,
     for (i = 1; i < argn - 1; i++) {
         Janet attr = argv[i];
         switch (janet_type(attr)) {
-        case JANET_TUPLE:
-            janetc_cerror(c, "unexpected form - did you intend to use defn?");
-            break;
-        default:
-            janetc_error(c,
-                         janet_formatc("cannot add metadata %v to binding %s",
-                                       attr, binding_name));
-            break;
-        case JANET_KEYWORD:
-            janet_table_put(tab, attr, janet_wrap_true());
-            break;
-        case JANET_STRING:
-            #ifdef JANET_UNBUNDLED_DOCS
-            /* NOTE: does this mean attr gets GC'd later? */
-            if(!writedocfile(binding_name, source, janet_unwrap_string(attr),
-                             "/tmp/docs/", sm.line, sm.column)) {
-                janet_panic("Error writing doc files.");
-            }
-            #else
-            janet_table_put(tab, janet_ckeywordv("doc"), attr);
-            #endif
-            break;
-        case JANET_STRUCT:
-            janet_table_merge_struct(tab, janet_unwrap_struct(attr));
-            break;
+            case JANET_TUPLE:
+                janetc_cerror(c, "unexpected form - did you intend to use defn?");
+                break;
+            default:
+                janetc_error(c,
+                             janet_formatc("cannot add metadata %v to binding %s",
+                                           attr, binding_name));
+                break;
+            case JANET_KEYWORD:
+                janet_table_put(tab, attr, janet_wrap_true());
+                break;
+            case JANET_STRING:
+#ifdef JANET_UNBUNDLED_DOCS
+                if (!writedocfile(binding_name, source, janet_unwrap_string(attr),
+                                  "/tmp/docs/", sm.line, sm.column)) {
+                    janet_panic("Error writing doc files.");
+                }
+#else
+                janet_table_put(tab, janet_ckeywordv("doc"), attr);
+#endif
+                break;
+            case JANET_STRUCT:
+                janet_table_merge_struct(tab, janet_unwrap_struct(attr));
+                break;
         }
     }
     return tab;
