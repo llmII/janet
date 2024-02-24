@@ -305,8 +305,12 @@ static JanetSlot janetc_varset(JanetFopts opts, int32_t argn, const Janet *argv)
 }
 
 #define JANET_UNBUNDLED_DOCS
-int writedocfile(const char *symbol, const char *source_file, const char *doc,
-                  char *directory, int32_t line, int32_t column) {
+int writedocfile(const char *symbol,
+                 const uint8_t *source_file,
+                 JanetString doc,
+                 char *directory,
+                 int32_t line,
+                 int32_t column) {
     size_t pel = 0, sl = 0, cl = 0, sfl = 0, ll = 0, el = 0, dl = 0;
     char *doc_fn = NULL, *pe = NULL, *tmp = NULL;
     FILE *fd = NULL;
@@ -314,11 +318,11 @@ int writedocfile(const char *symbol, const char *source_file, const char *doc,
     /* Determine lengths. */
     sl += strlen(symbol);
     cl += snprintf(NULL, 0, "%d", column);
-    sfl += strlen(source_file);
+    sfl += strlen((const char *)source_file);
     ll += snprintf(NULL, 0, "%d", line);
 
     /* Get a buffer large enough for the combination of the above. */
-    pel = sl + el + sfl + ll + 3; /* 3 for separators */
+    pel = sl + el + sfl + ll + 4; /* 1 for \0 and  3 for separators */
     pe = malloc(pel);
     if (pe == NULL)
         goto error;
@@ -327,8 +331,8 @@ int writedocfile(const char *symbol, const char *source_file, const char *doc,
     /* line'column'symbol'source */
     tmp = pe;
 
-    snprintf(tmp, cl + 1, "%d", line);
-    tmp += cl;
+    snprintf(tmp, ll + 1, "%d", line);
+    tmp += ll;
     *tmp = '\'';
     tmp++;
 
@@ -365,8 +369,7 @@ int writedocfile(const char *symbol, const char *source_file, const char *doc,
     char *decoded = b64_decode(doc_fn + dl, el, &el); /* DEBUG print */
     printf("\tsymbol='%s' source='%s' directory='%s' line='%d'"
            " column='%d'\n\tencodes_to='%s'\n\tdecodes_from='%s'"
-           "\n\tdecodes_to='%s'"
-           " with lossage='%zu' */\n",
+           "\n\tdecodes_to='%s' with lossage='%zu' */\n",
            symbol,
            source_file,
            directory,
@@ -382,7 +385,7 @@ int writedocfile(const char *symbol, const char *source_file, const char *doc,
     if (fd == NULL) goto error;
     free(doc_fn);
     doc_fn = NULL;
-    if(EOF == fputs(doc, fd)) goto error;
+    if(EOF == fputs((char*)doc, fd)) goto error;
     if(EOF == fflush(fd)) goto error;
     fclose(fd);
     fd = NULL;
