@@ -35,6 +35,7 @@
 /* #define JANET_NO_THREADS */
 /* #define JANET_NO_FFI */
 /* #define JANET_NO_FFI_JIT */
+/* #define JANET_NO_UNBUNDLED_DOCS */
 
 /* Other settings */
 /* #define JANET_DEBUG */

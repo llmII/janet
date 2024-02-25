@@ -304,7 +304,6 @@ static JanetSlot janetc_varset(JanetFopts opts, int32_t argn, const Janet *argv)
     }
 }
 
-#define JANET_UNBUNDLED_DOCS
 int writedocfile(const char *symbol,
                  const uint8_t *source_file,
                  JanetString doc,
@@ -385,6 +384,7 @@ int writedocfile(const char *symbol,
            decoded,
            el);
     fflush(stdout); /* DEBUG print */
+    free(decoded);
 
     fd = fopen(doc_fn, "w");
     if (fd == NULL) goto error;
@@ -437,9 +437,12 @@ static JanetTable *handleattr(JanetCompiler *c,
                 janet_table_put(tab, attr, janet_wrap_true());
                 break;
             case JANET_STRING:
-#ifdef JANET_UNBUNDLED_DOCS
+#ifndef JANET_NO_UNBUNDLED_DOCS
                 if (!writedocfile(binding_name, source, janet_unwrap_string(attr),
                                   "/tmp/docs/", sm.line, sm.column)) {
+                    /* TODO: Put it in memory if we fail.
+                     * Just don't do that yet, need to leave this painful
+                     * for now. */
                     janet_panic("Error writing doc files.");
                 }
 #else
