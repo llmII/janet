@@ -310,18 +310,15 @@ int writedocfile(const char *symbol,
                  char *directory,
                  int32_t line,
                  int32_t column) {
-    size_t pel = 0, sl = 0, cl = 0, sfl = 0, ll = 0, el = 0, dl = 0;
+    size_t pel = 0, el = 0, dl = 0;
     char *doc_fn = NULL, *pe = NULL, *tmp = NULL;
     FILE *fd = NULL;
 
     /* Determine lengths. */
-    sl = strlen(symbol);
-    cl = snprintf(NULL, 0, "%d", column);
-    sfl = strlen((const char *)source_file);
-    ll = snprintf(NULL, 0, "%d", line);
+    pel = snprintf(NULL, 0, "%d'%d'%s'%s",
+                   line, column, symbol, source_file) + 1;
 
     /* Get a buffer large enough for the combination of the above. */
-    pel = sl + cl + sfl + ll + 4; /* 1 for \0 and  3 for separators */
     pe = malloc(pel);
     if (pe == NULL)
         goto error;
@@ -330,23 +327,7 @@ int writedocfile(const char *symbol,
     /* line'column'symbol'source */
     tmp = pe;
 
-    snprintf(tmp, ll + 1, "%d", line);
-    tmp += ll;
-    *tmp = '\'';
-    tmp++;
-
-    snprintf(tmp, cl + 1, "%d", column);
-    tmp += cl;
-    *tmp = '\'';
-    tmp++;
-
-    memcpy(tmp, symbol, sl);
-    tmp += sl;
-    *tmp = '\'';
-    tmp++;
-
-    memcpy(tmp, source_file, sfl);
-    *(tmp + sfl) = '\0';
+    snprintf(tmp, pel, "%d'%d'%s'%s", line, column, symbol, source_file);
 
     /* Allocate document filename */
     el = b64_encode(pe, NULL, pel);
@@ -367,18 +348,13 @@ int writedocfile(const char *symbol,
     /* Commence file operations */
     char *decoded = b64_decode(doc_fn + dl, el, &el); /* DEBUG print */
     printf("   symbol=%s source=%s directory=%s\n"
-           "   pel=%zu sl=%zu cl=%zu sfl=%zu ll=%zu dl=%zu"
-           "   line=%d column=%d\n"
+           "   dl=%zu line=%d column=%d\n"
            "   encodes_to=%s\n"
            "   decodes_from=%s\n"
            "   decodes_to=%s\n"
            "   with lossage=%zu */\n",
-           symbol,
-           source_file,
-           directory,
-           pel, sl, cl, sfl, ll, dl,
-           line,
-           column,
+           symbol, source_file, directory,
+           dl, line, column,
            doc_fn,
            doc_fn + dl,
            decoded,
