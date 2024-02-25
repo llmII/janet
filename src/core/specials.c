@@ -311,7 +311,7 @@ int writedocfile(const char *symbol,
                  int32_t line,
                  int32_t column) {
     size_t pel = 0, el = 0, dl = 0;
-    char *doc_fn = NULL, *pe = NULL, *tmp = NULL;
+    char *doc_fn = NULL, *pe = NULL;
     FILE *fd = NULL;
 
     /* Determine lengths. */
@@ -324,10 +324,7 @@ int writedocfile(const char *symbol,
         goto error;
 
     /* Fill the filename pre-encode buffer. */
-    /* line'column'symbol'source */
-    tmp = pe;
-
-    snprintf(tmp, pel, "%d'%d'%s'%s", line, column, symbol, source_file);
+    snprintf(pe, pel, "%d'%d'%s'%s", line, column, symbol, source_file);
 
     /* Allocate document filename */
     el = b64_encode(pe, NULL, pel);
