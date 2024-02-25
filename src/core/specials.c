@@ -416,7 +416,8 @@ static JanetTable *handleattr(JanetCompiler *c,
                     /* TODO: Put it in memory if we fail.
                      * Just don't do that yet, need to leave this painful
                      * for now. */
-                    janet_panic("Error writing doc files.");
+                    janet_panicf("Could not write doc files for"
+                                 " binding %s", binding_name);
                 }
 #else
                 janet_table_put(tab, janet_ckeywordv("doc"), attr);
